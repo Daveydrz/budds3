@@ -1,0 +1,793 @@
+from langdetect import detect_langs
+import os
+import re
+import json
+import time
+import queue
+import threading
+import tempfile
+import concurrent.futures
+from pathlib import Path
+from pydub import AudioSegment
+from pydub.playback import _play_with_simpleaudio
+import numpy as np
+import pvporcupine
+import pyaudio
+import requests
+import sounddevice as sd
+import websockets
+import asyncio
+import webrtcvad
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.io.wavfile import write
+from kokoro_onnx import Kokoro
+import soundfile as sf
+
+# === KONFIGURACJA ===
+MIC_DEVICE_INDEX = 3
+DEFAULT_LANG = "en"
+FAST_MODE = False
+device = "cuda" if 'cuda' in os.environ.get('CUDA_VISIBLE_DEVICES', '') or hasattr(np, "cuda") else "cpu"
+print(f"[Buddy] Running on device: {device}")
+
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+CHIME_PATH = "chime.wav"
+known_users_path = "known_users.json"
+THEMES_PATH = "themes_memory"
+LAST_USER_PATH = "last_user.json"
+os.makedirs(THEMES_PATH, exist_ok=True)
+
+FASTER_WHISPER_WS = "ws://localhost:9090"
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
+SERPAPI_ENDPOINT = "https://serpapi.com/search"
+WEATHERAPI_KEY = os.environ.get("WEATHERAPI_KEY", "")
+WEATHERAPI_ENDPOINT = "http://api.weatherapi.com/v1/current.json"
+HOME_ASSISTANT_URL = os.environ.get("HOME_ASSISTANT_URL", "http://localhost:8123")
+HOME_ASSISTANT_TOKEN = os.environ.get("HOME_ASSISTANT_TOKEN", "")
+
+KOKORO_VOICES = {
+    "pl": "af_heart",
+    "en": "af_heart",
+    "it": "if_sara",
+}
+KOKORO_LANGS = {
+    "pl": "pl",
+    "en": "en-us",
+    "it": "it"
+}
+kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+
+if os.path.exists(known_users_path):
+    with open(known_users_path, "r", encoding="utf-8") as f:
+        known_users = json.load(f)
+else:
+    known_users = {}
+
+tts_queue = queue.Queue()
+playback_queue = queue.Queue()
+current_playback = None
+playback_stop_flag = threading.Event()
+last_buddy_output = ""
+
+buddy_talking = threading.Event()
+vad_triggered = threading.Event()
+LAST_FEW_BUDDY = []
+
+def stop_playback():
+    global current_playback
+    playback_stop_flag.set()
+    if current_playback and hasattr(current_playback, "is_playing") and current_playback.is_playing():
+        current_playback.stop()
+        current_playback = None
+    while not playback_queue.empty():
+        try:
+            playback_queue.get_nowait()
+            playback_queue.task_done()
+        except queue.Empty:
+            break
+
+def listen_for_stopword():
+    vad = webrtcvad.Vad(2)
+    samplerate = 16000
+    blocksize = 320
+    silence_timeout = 0.8
+    frames = []
+    start_time = time.time()
+    try:
+        with sd.InputStream(device=MIC_DEVICE_INDEX, samplerate=samplerate, channels=1, dtype='int16', blocksize=blocksize) as stream:
+            while buddy_talking.is_set():
+                frame, _ = stream.read(blocksize)
+                frames.append(frame)
+                if len(frames) > int(samplerate / blocksize * 1.2):
+                    frames = frames[-int(samplerate / blocksize * 1.2):]
+                if not vad.is_speech(frame.tobytes(), samplerate):
+                    if time.time() - start_time > silence_timeout:
+                        frames = []
+                        start_time = time.time()
+                        continue
+                else:
+                    start_time = time.time()
+                if len(frames) * blocksize >= samplerate:
+                    audio_np = np.concatenate(frames, axis=0).astype(np.int16)
+                    text = stt_stream(audio_np)
+                    if text and "buddy stop" in text.lower():
+                        print("[Buddy][STOPWORD] Detected 'buddy stop'! Interrupting.")
+                        stop_playback()
+                        break
+    except Exception as e:
+        print(f"[Buddy][STOPWORD] Error: {e}")
+
+def audio_playback_worker():
+    global current_playback
+    while True:
+        audio = playback_queue.get()
+        if audio is None:
+            break
+        try:
+            playback_stop_flag.clear()
+            buddy_talking.set()
+            # Start nasłuch na "Buddy stop"
+            stopword_thread = threading.Thread(target=listen_for_stopword)
+            stopword_thread.daemon = True
+            stopword_thread.start()
+            current_playback = _play_with_simpleaudio(audio)
+            while current_playback and current_playback.is_playing():
+                if playback_stop_flag.is_set():
+                    current_playback.stop()
+                    break
+                time.sleep(0.05)
+            current_playback = None
+        except Exception as e:
+            print(f"[Buddy] Audio playback error: {e}")
+        finally:
+            buddy_talking.clear()
+            time.sleep(2.0)
+            playback_queue.task_done()
+
+def tts_playback_worker():
+    while True:
+        item = tts_queue.get()
+        if item is None:
+            break
+        if isinstance(item, tuple):
+            if len(item) == 2:
+                text, lang = item
+                style = {}
+            else:
+                text, lang, style = item
+        else:
+            text, lang, style = item, DEFAULT_LANG, {}
+        try:
+            print(f"\n[Buddy] ==>> Buddy mówi: {text}\n")
+            generate_and_play_kokoro(text, lang)
+        except Exception as e:
+            print(f"[Buddy] TTS playback error: {e}")
+        tts_queue.task_done()
+
+threading.Thread(target=audio_playback_worker, daemon=True).start()
+threading.Thread(target=tts_playback_worker, daemon=True).start()
+
+def wait_after_buddy_speaks(delay=1.2):
+    playback_queue.join()
+    while buddy_talking.is_set():
+        time.sleep(0.05)
+    time.sleep(delay)
+
+def vad_and_listen():
+    vad = webrtcvad.Vad(3)
+    samplerate = 16000
+    blocksize = 320
+    with sd.InputStream(device=MIC_DEVICE_INDEX, samplerate=samplerate, channels=1, dtype='int16', blocksize=blocksize) as stream:
+        print("[Buddy] Nasłuch (mów kiedy chcesz)...")
+        silence_thresh = 1.0
+        min_speech_frames = 6
+        frame_buffer = []
+        speech_detected = 0
+        while True:
+            if buddy_talking.is_set():
+                time.sleep(0.1)
+                continue
+            frame, _ = stream.read(blocksize)
+            if vad.is_speech(frame.tobytes(), samplerate):
+                frame_buffer.append(frame)
+                speech_detected += 1
+                if speech_detected >= min_speech_frames:
+                    print("[Buddy] VAD: wykryto mowę! START NAGRYWANIA")
+                    audio = frame_buffer.copy()
+                    last_speech = time.time()
+                    start_time = time.time()
+                    frame_buffer.clear()
+                    while time.time() - last_speech < silence_thresh and (time.time() - start_time) < 8:
+                        frame, _ = stream.read(blocksize)
+                        audio.append(frame)
+                        if vad.is_speech(frame.tobytes(), samplerate):
+                            last_speech = time.time()
+                    print("[Buddy] Koniec nagrania. Wysyłam do Whisper...")
+                    audio_np = np.concatenate(audio, axis=0)
+                    max_len = 8 * 16000
+                    if len(audio_np) > max_len:
+                        print(f"[Buddy] Audio za długie ({len(audio_np)}), ucina do 8s.")
+                        audio_np = audio_np[:max_len]
+                    if np.abs(audio_np).max() < 300:
+                        print("[Buddy] Za cichy sygnał – ignoruję.")
+                        return np.zeros(16000, dtype=np.int16)
+                    if np.all(audio_np == 0) or len(audio_np) < 1200:
+                        print("[Buddy] Zbyt mało sygnału/tylko cisza – pomijam odszumianie.")
+                        return audio_np.astype(np.int16)
+                    print(f"[Buddy] Długość audio do Whisper: {len(audio_np)}, min: {np.min(audio_np)}, max: {np.max(audio_np)}")
+                    return audio_np.astype(np.int16)
+            else:
+                if len(frame_buffer) > 0:
+                    frame_buffer.clear()
+                speech_detected = 0
+
+def stt_stream(audio):
+    print(f"[Buddy] Rozpoczynam stt_stream, długość audio: {len(audio)}")
+    async def ws_stt(audio):
+        print("[Buddy] Łączę się z serwerem Whisper...")
+        try:
+            async with websockets.connect(FASTER_WHISPER_WS, ping_interval=None) as ws:
+                print("[Buddy] Połączono, wysyłam audio...")
+                await ws.send(audio.tobytes())
+                await ws.send("__end__")
+                print("[Buddy] Audio wysłane, czekam na odpowiedź...")
+                try:
+                    message = await asyncio.wait_for(ws.recv(), timeout=18)
+                except asyncio.TimeoutError:
+                    print("[Buddy] Whisper timeout. Brak odpowiedzi przez 18s.")
+                    return ""
+                print(f"[Buddy] Odpowiedź odebrana z Whisper: {message}")
+                return message.decode("utf-8") if isinstance(message, bytes) else message
+        except Exception as e:
+            print(f"[Buddy] Błąd połączenia z Whisper: {e}")
+            return ""
+    return asyncio.run(ws_stt(audio))
+
+def is_noise_or_gibberish(text):
+    if not text or len(text.strip()) < 2:
+        print(f"[Buddy] Zignorowano pustą transkrypcję: '{text}'")
+        return True
+    if re.match(r"^[^\w\s]{3,}$", text):
+        print(f"[Buddy] Zignorowano bełkot: '{text}'")
+        return True
+    if max([len(w) for w in text.split()]) > 15:
+        print(f"[Buddy] Zignorowano zbyt długie słowo: '{text}'")
+        return True
+    if re.search(r'(.)\1{3,}', text):
+        print(f"[Buddy] Zignorowano powtórzenia: '{text}'")
+        return True
+    if len(text.split()) == 1 and text.lower() not in ["tak", "nie", "ok", "hello", "hi", "cześć"]:
+        print(f"[Buddy] Zignorowano pojedyncze słowo: '{text}'")
+        return True
+    if not re.search(r'[aeiouyąęó]', text.lower()):
+        print(f"[Buddy] Zignorowano bezsamogłoskowy tekst: '{text}'")
+        return True
+    if re.search(r'[^\x00-\x7FąćęłńóśźżĄĆĘŁŃÓŚŹŻ ]', text):
+        print(f"[Buddy] Zignorowano nieliterowy tekst: '{text}'")
+        return True
+    return False
+
+def fast_listen_and_transcribe():
+    wait_after_buddy_speaks()
+    print("[Buddy] Start funkcji fast_listen_and_transcribe")
+    audio = vad_and_listen()
+    print(f"[Buddy] Debug: Długość audio po vad_and_listen: {len(audio)}, typ: {type(audio)}")
+    try:
+        write("temp_input.wav", 16000, audio)
+    except Exception as e:
+        print(f"[Buddy] Błąd przy zapisie temp_input.wav: {e}")
+    text = stt_stream(audio)
+    print(f"[Buddy] Rozpoznałem: {text}")
+    if is_noise_or_gibberish(text):
+        print("[Buddy] Zignorowano szum/nieczytelny tekst.")
+        return ""
+    return text
+
+def speak_async(text, lang=DEFAULT_LANG, style=None):
+    if style is not None:
+        tts_queue.put((text, lang, style))
+    else:
+        tts_queue.put((text, lang))
+
+def play_chime():
+    try:
+        audio = AudioSegment.from_wav(CHIME_PATH)
+        playback_queue.put(audio)
+    except Exception as e:
+        print(f"[Buddy] Error playing chime: {e}")
+
+def save_known_users():
+    with open(known_users_path, "w", encoding="utf-8") as f:
+        json.dump(known_users, f, indent=2, ensure_ascii=False)
+
+def load_user_history(name):
+    path = f"history_{name}.json"
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def save_user_history(name, history):
+    path = f"history_{name}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(history[-20:], f, ensure_ascii=False, indent=2)
+
+def extract_topic_from_text(text):
+    words = re.findall(r'\b\w+\b', text.lower())
+    freq = {}
+    for w in words:
+        if len(w) < 4:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+    if freq:
+        return max(freq, key=freq.get)
+    return None
+
+def update_thematic_memory(user, utterance):
+    topic = extract_topic_from_text(utterance)
+    if not topic:
+        return
+    theme_path = os.path.join(THEMES_PATH, f"{user}_themes.json")
+    if os.path.exists(theme_path):
+        with open(theme_path, "r", encoding="utf-8") as f:
+            themes = json.load(f)
+    else:
+        themes = {}
+    themes[topic] = themes.get(topic, 0) + 1
+    with open(theme_path, "w", encoding="utf-8") as f:
+        json.dump(themes, f, ensure_ascii=False, indent=2)
+
+def get_frequent_topics(user, top_n=3):
+    theme_path = os.path.join(THEMES_PATH, f"{user}_themes.json")
+    if not os.path.exists(theme_path):
+        return []
+    with open(theme_path, "r", encoding="utf-8") as f:
+        themes = json.load(f)
+    sorted_themes = sorted(themes.items(), key=lambda x: x[1], reverse=True)
+    return [topic for topic, _ in sorted_themes[:top_n]]
+
+def generate_embedding(text):
+    return embedding_model.encode([text])[0]
+
+def match_known_user(new_embedding, threshold=0.75):
+    best_name, best_score = None, 0
+    for name, emb in known_users.items():
+        sim = cosine_similarity([new_embedding], [emb])[0][0]
+        if sim > best_score:
+            best_name, best_score = name, sim
+    return (best_name, best_score) if best_score >= threshold else (None, best_score)
+
+def get_last_user():
+    if os.path.exists(LAST_USER_PATH):
+        try:
+            with open(LAST_USER_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)["name"]
+        except Exception:
+            return None
+    return None
+
+def set_last_user(name):
+    with open(LAST_USER_PATH, "w", encoding="utf-8") as f:
+        json.dump({"name": name}, f)
+
+def identify_or_register_user():
+    if FAST_MODE:
+        return "Guest"
+    last_user = get_last_user()
+    if last_user and last_user in known_users:
+        print(f"[Buddy] Welcome back, {last_user}!")
+        return last_user
+    speak_async("Cześć! Jak masz na imię?", "pl")
+    speak_async("Hi! What's your name?", "en")
+    speak_async("Ciao! Come ti chiami?", "it")
+    playback_queue.join()
+    name = fast_listen_and_transcribe().strip().title()
+    if not name:
+        name = f"User{int(time.time())}"
+    known_users[name] = generate_embedding(name).tolist()
+    save_known_users()
+    set_last_user(name)
+    speak_async(f"Miło Cię poznać, {name}!", lang="pl")
+    playback_queue.join()
+    return name
+
+def build_personality_prompt(tone):
+    personality_map = {
+        "friendly": "You're a warm and witty assistant named Buddy. You respond with a friendly, conversational tone, often adding light humor or personal touches.",
+        "professional": "You're a concise and professional assistant named Buddy. You provide clear, accurate answers with a respectful tone.",
+        "neutral": "You're a helpful assistant named Buddy. You respond naturally and clearly in a neutral tone."
+    }
+    personality_desc = personality_map.get(tone, personality_map["neutral"])
+    return f"""{personality_desc}
+Always answer like you're talking to a real person. Avoid robotic phrasing.
+Keep responses engaging. If the user sounds confused or emotional, show empathy.
+Your responses can use short interjections like 'Hmm', 'I see', 'Got it!', 'Great question!'.
+"""
+
+def decide_reply_length(question, conversation_mode="auto"):
+    short_triggers = ["what time", "who", "quick", "fast", "short", "how many", "when"]
+    long_triggers = ["explain", "describe", "details", "why", "history", "story"]
+    q = question.lower()
+    if conversation_mode == "fast":
+        return "short"
+    if conversation_mode == "long":
+        return "long"
+    if any(t in q for t in short_triggers):
+        return "short"
+    if any(t in q for t in long_triggers):
+        return "long"
+    return "long" if len(q.split()) > 8 else "short"
+
+def build_llama_system_prompt(name, tone_style, history, question, lang, topics, reply_length):
+    system_prompt = build_personality_prompt(tone_style)
+    lang_map = {"pl": "Polish", "en": "English", "it": "Italian"}
+    lang_name = lang_map.get(lang, "English")
+    system_prompt += (
+        f"\nIMPORTANT: Always answer in {lang_name} language, matching the user's language "
+        f"(if user asks in Polish, answer in Polish, if in English, answer in English, if in Italian, answer in Italian)."
+        "\nNever switch language unless user does."
+    )
+    if topics:
+        system_prompt += f"\nYou remember these user interests/topics: {', '.join(topics)}.\n"
+    system_prompt += (
+        "\nConversation history:\n" +
+        "\n".join([f"User: {t['user']}\nBuddy: {t['buddy']}" for t in history[-2:]]) +
+        f"\nUser: {question}\nBuddy:"
+    )
+    if reply_length == "short":
+        system_prompt += "\nPlease answer concisely, in 1-2 sentences."
+    elif reply_length == "long":
+        system_prompt += "\nFeel free to give a detailed answer."
+    return system_prompt
+
+def is_echo_of_buddy(user_text, buddy_text, threshold=0.87):
+    if not user_text.strip() or not buddy_text.strip():
+        return False
+    embedding1 = embedding_model.encode([user_text])[0]
+    embedding2 = embedding_model.encode([buddy_text])[0]
+    score = cosine_similarity([embedding1], [embedding2])[0][0]
+    if len(user_text.split()) <= 6 and score >= threshold:
+        return True
+    return False
+
+SPAMMY_PHRASES = [
+    "thank you", "you're welcome", "bye", "see you", "it was my pleasure", "i hope your day", "thanks again", "goodbye"
+]
+def is_spammy_echo(user_text, buddy_history):
+    if not user_text.strip():
+        return True
+    lower = user_text.strip().lower()
+    if any(phrase in lower for phrase in SPAMMY_PHRASES):
+        return True
+    if len(user_text.split()) <= 6 and buddy_history:
+        if is_echo_of_buddy(user_text, buddy_history[-1], threshold=0.87):
+            return True
+    return False
+
+def split_into_sentences(text):
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s for s in sentences if s.strip()]
+
+def split_long_text(text, max_length=200):
+    sents = split_into_sentences(text)
+    chunks = []
+    buf = ""
+    for s in sents:
+        if len(buf) + len(s) + 1 <= max_length:
+            buf += (" " + s)
+        else:
+            if buf:
+                chunks.append(buf.strip())
+            buf = s
+    if buf:
+        chunks.append(buf.strip())
+    return chunks
+
+def should_search_internet(question):
+    triggers = [
+        "szukaj w internecie", "sprawdź w internecie", "co to jest", "dlaczego", "jak zrobić",
+        "what is", "why", "how to", "search the internet", "find online"
+    ]
+    q = question.lower()
+    return any(t in q for t in triggers)
+
+def search_internet(question, lang):
+    params = {
+        "q": question,
+        "api_key": SERPAPI_KEY,
+        "hl": lang
+    }
+    try:
+        r = requests.get(SERPAPI_ENDPOINT, params=params, timeout=7)
+        r.raise_for_status()
+        data = r.json()
+        if "answer_box" in data and "answer" in data["answer_box"]:
+            return data["answer_box"]["answer"]
+        if "organic_results" in data and len(data["organic_results"]) > 0:
+            return data["organic_results"][0].get("snippet", "No answer found.")
+        return "No answer found."
+    except Exception as e:
+        print("[Buddy] SerpAPI error:", e)
+        return "Unable to check the Internet now."
+
+def get_weather(location="Warsaw", lang="en"):
+    key = os.environ.get("WEATHERAPI_KEY", "YOUR_FALLBACK_KEY")
+    url = "http://api.weatherapi.com/v1/current.json"
+    params = {
+        "key": key,
+        "q": location,
+        "lang": lang
+    }
+    try:
+        r = requests.get(url, params=params, timeout=7)
+        r.raise_for_status()
+        data = r.json()
+        desc = data["current"]["condition"]["text"]
+        temp = data["current"]["temp_c"]
+        feels = data["current"]["feelslike_c"]
+        city = data["location"]["name"]
+        return f"Weather in {city}: {desc}, temperature {temp}°C, feels like {feels}°C."
+    except Exception as e:
+        print("[Buddy] WeatherAPI error:", e)
+        return "Unable to check the weather now."
+
+def extract_location_from_question(question):
+    match = re.search(r"(w|in|dla)\s+([A-Za-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ\s\-]+)", question, re.IGNORECASE)
+    if match:
+        return match.group(2).strip()
+    return "Warsaw"
+
+def should_get_weather(question):
+    q = question.lower()
+    keywords = ["pogoda", "jaka jest pogoda", "weather", "temperature", "temperatura"]
+    return any(k in q for k in keywords)
+
+def send_homeassistant_command(entity_id, service, data=None):
+    url = f"{HOME_ASSISTANT_URL}/api/services/{service.replace('.', '/')}"
+    headers = {
+        "Authorization": f"Bearer {HOME_ASSISTANT_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "entity_id": entity_id
+    }
+    if data:
+        payload.update(data)
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=6)
+        if r.status_code in (200, 201):
+            return True
+        print("[Buddy] Home Assistant error:", r.text)
+        return False
+    except Exception as e:
+        print("[Buddy] Home Assistant exception:", e)
+        return False
+
+def handle_homeassistant_command(question):
+    q = question.lower()
+    if "turn on the light" in q or "włącz światło" in q or "zapal światło" in q:
+        room = extract_location_from_question(question)
+        entity_id = f"light.{room.lower().replace(' ', '_')}"
+        succ = send_homeassistant_command(entity_id, "light.turn_on")
+        return f"Light in {room} has been turned on." if succ else f"Failed to turn on the light in {room}."
+    if "turn off the light" in q or "wyłącz światło" in q:
+        room = extract_location_from_question(question)
+        entity_id = f"light.{room.lower().replace(' ', '_')}"
+        succ = send_homeassistant_command(entity_id, "light.turn_off")
+        return f"Light in {room} has been turned off." if succ else f"Failed to turn off the light in {room}."
+    if "spotify" in q:
+        succ = send_homeassistant_command("media_player.spotify", "media_player.media_play")
+        return "Spotify started." if succ else "Failed to start Spotify."
+    if "youtube" in q or "smarttube" in q:
+        succ = send_homeassistant_command("media_player.tv_salon", "media_player.select_source", {"source": "YouTube"})
+        return "YouTube launched on TV." if succ else "Failed to launch YouTube on TV."
+    return None
+
+def should_handle_homeassistant(question):
+    q = question.lower()
+    keywords = ["turn on the light", "włącz światło", "zapal światło", "turn off the light", "wyłącz światło", "spotify", "youtube", "smarttube", "odtwórz"]
+    return any(k in q for k in keywords)
+
+def should_end_conversation(text):
+    end_phrases = [
+        "koniec", "do widzenia", "dziękuję", "thanks", "bye", "goodbye", "that's all", "quit", "exit"
+    ]
+    if not text:
+        return False
+    lower = text.strip().lower()
+    return any(phrase in lower for phrase in end_phrases)
+
+def ask_hermes_llamacpp_http(prompt, max_tokens=60, temperature=0.5):
+    """
+    Wysyła prompt do lokalnego serwera llama.cpp (Hermes) i zwraca odpowiedź tekstową.
+    """
+    url = "http://127.0.0.1:8080/completion"
+    payload = {
+        "prompt": prompt,
+        "n_predict": max_tokens,
+        "temperature": temperature,
+        "stream": False
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=120)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("content", "")
+    except Exception as e:
+        print(f"[Buddy][Hermes HTTP] Błąd: {e}")
+        return "Nie udało się uzyskać odpowiedzi z Hermesa."
+
+def handle_user_interaction(speaker, history, conversation_mode="auto"):
+    global last_buddy_output, LAST_FEW_BUDDY
+    wait_after_buddy_speaks(delay=1.2)
+    print("[Buddy] Active conversation. Speak when ready!")
+    vad_triggered.clear()
+    while buddy_talking.is_set():
+        time.sleep(0.05)
+    question = fast_listen_and_transcribe()
+    play_chime()
+    lang = detect_language(question)
+    print(f"[Buddy] Detected language: {lang}")
+    if vad_triggered.is_set():
+        print("[Buddy] Barage-in: live TTS stopped, moving to new question.")
+        vad_triggered.clear()
+    if is_spammy_echo(question, LAST_FEW_BUDDY):
+        print("[Buddy] Ignored echo/repetition.")
+        return True
+    if not question:
+        return True
+    INTERRUPT_PHRASES = ["stop", "buddy stop", "przerwij", "cancel"]
+    if any(phrase in question.lower() for phrase in INTERRUPT_PHRASES):
+        print("[Buddy] Received interrupt command.")
+        stop_playback()
+        return True
+    if should_end_conversation(question):
+        print("[Buddy] Ending conversation as requested.")
+        return False
+    style = {"emotion": "neutral"}
+    if should_get_weather(question):
+        location = extract_location_from_question(question)
+        forecast = get_weather(location, lang)
+        speak_async(forecast, lang, style)
+        return True
+    if should_handle_homeassistant(question):
+        answer = handle_homeassistant_command(question)
+        if answer:
+            speak_async(answer, lang, style)
+            return True
+    if should_search_internet(question):
+        result = search_internet(question, lang)
+        speak_async(result, lang, style)
+        return True
+    llm_start_time = time.time()
+    ask_llama3_streaming(question, speaker, history, lang, conversation_mode, style=style)
+    print(f"[TIMING] LLM generation time: {time.time() - llm_start_time:.2f} seconds")
+    if last_buddy_output.strip() and len(last_buddy_output.split()) > 2:
+        LAST_FEW_BUDDY.append(last_buddy_output)
+        if len(LAST_FEW_BUDDY) > 3:
+            LAST_FEW_BUDDY = LAST_FEW_BUDDY[-3:]
+    return True
+
+def ask_llama3_streaming(question, name, history, lang=DEFAULT_LANG, conversation_mode="auto", style=None):
+    global last_buddy_output
+    update_thematic_memory(name, question)
+    topics = get_frequent_topics(name, top_n=3)
+    user_tones = {
+        "Dawid": "friendly",
+        "Anna": "professional",
+        "Guest": "neutral"
+    }
+    tone_style = user_tones.get(name, "neutral")
+    reply_length = decide_reply_length(question, conversation_mode)
+    system_prompt = build_llama_system_prompt(
+        name, tone_style, history, question, lang, topics, reply_length
+    )
+    full_text = ""
+    try:
+        # --- HERMES integration via local llama.cpp server ---
+        print("[Buddy] Sending prompt to Hermes (llama.cpp HTTP API)...")
+        full_text = ask_hermes_llamacpp_http(system_prompt, max_tokens=60, temperature=0.5)
+        print(full_text)
+    except Exception as e:
+        print("[Buddy] Hermes HTTP error:", e)
+    print()
+    tts_start_time = time.time()
+    if full_text.strip():
+        for chunk in split_long_text(full_text.strip()):
+            speak_async(chunk, lang, style)
+    print(f"[TIMING] Passed to TTS in: {time.time() - tts_start_time:.2f} seconds")
+    last_buddy_output = full_text
+    history.append({"user": question, "buddy": full_text})
+    if not FAST_MODE:
+        save_user_history(name, history)
+
+def generate_and_play_kokoro(text, lang=None):
+    detected_lang = lang or detect_language(text)
+    voice = KOKORO_VOICES.get(detected_lang, KOKORO_VOICES["en"])
+    kokoro_lang = KOKORO_LANGS.get(detected_lang, "en-us")
+    try:
+        samples, sample_rate = kokoro.create(text, voice=voice, speed=1.0, lang=kokoro_lang)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+            sf.write(f.name, samples, sample_rate)
+            audio = AudioSegment.from_wav(f.name)
+        playback_queue.put(audio)
+    except Exception as e:
+        print(f"[Buddy][Kokoro] Błąd TTS: {e}")
+
+def detect_language(text, fallback="en"):
+    try:
+        if not text or len(text.strip()) < 5:
+            print(f"[Buddy DEBUG] Text too short for reliable detection, defaulting to 'en'")
+            return "en"
+        langs = detect_langs(text)
+        print(f"[Buddy DEBUG] detect_langs for '{text}': {langs}")
+        if langs:
+            best = langs[0]
+            if best.prob > 0.8 and best.lang in ["en", "pl", "it"]:
+                return best.lang
+            if any(l.lang == "en" and l.prob > 0.5 for l in langs):
+                return "en"
+    except Exception as e:
+        print(f"[Buddy DEBUG] langdetect error: {e}")
+    return "en"
+
+def main():
+    access_key = "/PLJ88d4+jDeVO4zaLFaXNkr6XLgxuG7dh+6JcraqLhWQlk3AjMy9Q=="
+    keyword_paths = [r"hey-buddy_en_windows_v3_0_0.ppn"]
+    porcupine = pvporcupine.create(access_key=access_key, keyword_paths=keyword_paths)
+    pa = pyaudio.PyAudio()
+    stream = pa.open(rate=porcupine.sample_rate, channels=1, format=pyaudio.paInt16,
+                     input=True, frames_per_buffer=porcupine.frame_length)
+    print("[Buddy] Waiting for wake word 'Hey Buddy'...")
+    in_session, session_timeout = False, 45
+    speaker = None
+    history = []
+    last_time = 0
+    try:
+        while True:
+            if not in_session:
+                pcm = stream.read(porcupine.frame_length, exception_on_overflow=False)
+                pcm = np.frombuffer(pcm, dtype=np.int16)
+                if porcupine.process(pcm) >= 0:
+                    print("[Buddy] Wake word detected!")
+                    stop_playback()
+                    speaker = identify_or_register_user()
+                    history = load_user_history(speaker)
+                    print("[Buddy] Listening for next question...")
+                    in_session = handle_user_interaction(speaker, history)
+                    last_time = time.time()
+            else:
+                if time.time() - last_time > session_timeout:
+                    print("[Buddy] Session expired.")
+                    in_session = False
+                    continue
+                print("[Buddy] Listening for next question...")
+                stop_playback()
+                playback_queue.join()
+                while buddy_talking.is_set():
+                    time.sleep(0.05)
+                in_session = handle_user_interaction(speaker, history)
+                last_time = time.time()
+    except KeyboardInterrupt:
+        print("[Buddy] Interrupted by user.")
+    finally:
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
+        try:
+            pa.terminate()
+        except Exception:
+            pass
+        try:
+            porcupine.delete()
+        except Exception:
+            pass
+        executor.shutdown(wait=True)
+
+if __name__ == "__main__":
+    main()
