@@ -76,6 +76,8 @@ buddy_talking = threading.Event()
 vad_triggered = threading.Event()
 LAST_FEW_BUDDY = []
 
+full_duplex_interrupt_event = threading.Event()
+
 def stop_playback():
     global current_playback
     playback_stop_flag.set()
@@ -98,7 +100,7 @@ def listen_for_stopword():
     start_time = time.time()
     try:
         with sd.InputStream(device=MIC_DEVICE_INDEX, samplerate=samplerate, channels=1, dtype='int16', blocksize=blocksize) as stream:
-            while buddy_talking.is_set():
+            while buddy_talking.is_set() and not full_duplex_interrupt_event.is_set():
                 frame, _ = stream.read(blocksize)
                 frames.append(frame)
                 if len(frames) > int(samplerate / blocksize * 1.2):
@@ -113,12 +115,48 @@ def listen_for_stopword():
                 if len(frames) * blocksize >= samplerate:
                     audio_np = np.concatenate(frames, axis=0).astype(np.int16)
                     text = stt_stream(audio_np)
-                    if text and "buddy stop" in text.lower():
-                        print("[Buddy][STOPWORD] Detected 'buddy stop'! Interrupting.")
+                    if text and ("buddy stop" in text.lower() or "buddy" in text.lower()):
+                        print("[Buddy][STOPWORD] Detected interrupt! Interrupting.")
+                        full_duplex_interrupt_event.set()
                         stop_playback()
                         break
     except Exception as e:
         print(f"[Buddy][STOPWORD] Error: {e}")
+
+def full_duplex_listener():
+    vad = webrtcvad.Vad(2)
+    samplerate = 16000
+    blocksize = 320
+    silence_timeout = 0.8
+    frames = []
+    start_time = time.time()
+    try:
+        with sd.InputStream(device=MIC_DEVICE_INDEX, samplerate=samplerate, channels=1, dtype='int16', blocksize=blocksize) as stream:
+            while True:
+                if full_duplex_interrupt_event.is_set():
+                    time.sleep(0.1)
+                    continue
+                frame, _ = stream.read(blocksize)
+                frames.append(frame)
+                if len(frames) > int(samplerate / blocksize * 1.2):
+                    frames = frames[-int(samplerate / blocksize * 1.2):]
+                if not vad.is_speech(frame.tobytes(), samplerate):
+                    if time.time() - start_time > silence_timeout:
+                        frames = []
+                        start_time = time.time()
+                        continue
+                else:
+                    start_time = time.time()
+                if len(frames) * blocksize >= samplerate:
+                    audio_np = np.concatenate(frames, axis=0).astype(np.int16)
+                    text = stt_stream(audio_np)
+                    if text and ("buddy" in text.lower() or "buddy stop" in text.lower() or "hej buddy" in text.lower()):
+                        print("[Buddy][FULL DUPLEX] Natychmiastowa aktywacja!")
+                        full_duplex_interrupt_event.set()
+                        stop_playback()
+                        break
+    except Exception as e:
+        print(f"[Buddy][FULL DUPLEX] Error: {e}")
 
 def audio_playback_worker():
     global current_playback
@@ -129,13 +167,12 @@ def audio_playback_worker():
         try:
             playback_stop_flag.clear()
             buddy_talking.set()
-            # Start nasłuch na "Buddy stop"
             stopword_thread = threading.Thread(target=listen_for_stopword)
             stopword_thread.daemon = True
             stopword_thread.start()
             current_playback = _play_with_simpleaudio(audio)
             while current_playback and current_playback.is_playing():
-                if playback_stop_flag.is_set():
+                if playback_stop_flag.is_set() or full_duplex_interrupt_event.is_set():
                     current_playback.stop()
                     break
                 time.sleep(0.05)
@@ -169,6 +206,7 @@ def tts_playback_worker():
 
 threading.Thread(target=audio_playback_worker, daemon=True).start()
 threading.Thread(target=tts_playback_worker, daemon=True).start()
+threading.Thread(target=full_duplex_listener, daemon=True).start()
 
 def wait_after_buddy_speaks(delay=1.2):
     playback_queue.join()
@@ -187,7 +225,7 @@ def vad_and_listen():
         frame_buffer = []
         speech_detected = 0
         while True:
-            if buddy_talking.is_set():
+            if buddy_talking.is_set() or full_duplex_interrupt_event.is_set():
                 time.sleep(0.1)
                 continue
             frame, _ = stream.read(blocksize)
@@ -601,9 +639,6 @@ def should_end_conversation(text):
     return any(phrase in lower for phrase in end_phrases)
 
 def ask_hermes_llamacpp_http(prompt, max_tokens=60, temperature=0.5):
-    """
-    Wysyła prompt do lokalnego serwera llama.cpp (Hermes) i zwraca odpowiedź tekstową.
-    """
     url = "http://127.0.0.1:8080/completion"
     payload = {
         "prompt": prompt,
@@ -627,6 +662,10 @@ def handle_user_interaction(speaker, history, conversation_mode="auto"):
     vad_triggered.clear()
     while buddy_talking.is_set():
         time.sleep(0.05)
+    if full_duplex_interrupt_event.is_set():
+        print("[Buddy] FULL DUPLEX: przerwanie przez użytkownika.")
+        full_duplex_interrupt_event.clear()
+        return True
     question = fast_listen_and_transcribe()
     play_chime()
     lang = detect_language(question)
@@ -687,7 +726,6 @@ def ask_llama3_streaming(question, name, history, lang=DEFAULT_LANG, conversatio
     )
     full_text = ""
     try:
-        # --- HERMES integration via local llama.cpp server ---
         print("[Buddy] Sending prompt to Hermes (llama.cpp HTTP API)...")
         full_text = ask_hermes_llamacpp_http(system_prompt, max_tokens=60, temperature=0.5)
         print(full_text)
