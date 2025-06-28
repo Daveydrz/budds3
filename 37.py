@@ -408,6 +408,16 @@ def is_noise_or_gibberish(text):
         return False  # symbols are allowed
     return False
 
+def start_buddy_with_interrupt():
+    """Start Buddy with parallel interrupt system"""
+    print("[Buddy] 🚀 Starting Buddy with parallel interrupt system...")
+    
+    # Start the parallel interrupt detector immediately
+    threading.Thread(target=parallel_interrupt_detector, daemon=True).start()
+    
+    print("[Buddy] ✅ Parallel interrupt system active!")
+    # Continue with your normal Buddy startup...
+
 def update_reference_audio_realtime(pcm, sr):
     """Enhanced reference audio injection with perfect timing"""
     global ref_audio_buffer, playback_start_time
@@ -574,87 +584,69 @@ def _play_accumulated_audio_with_perfect_aec(audio_chunks):
 vad_thread_active = threading.Event()
 
 def background_vad_listener():
-    """Ultra-responsive VAD for instant interruptions"""
+    """Ultra-responsive VAD with instant interrupt capability"""
     global vad_thread_active
     
-    if vad_thread_active.is_set():
-        return
-        
+    print("[Buddy][VAD] 🎧 Full-duplex monitoring active")
     vad_thread_active.set()
-    vad = webrtcvad.Vad(1)  # High sensitivity for quick interrupts
+    
+    # Initialize audio stream
+    p = pyaudio.PyAudio()
+    stream = None
     
     try:
-        with sd.InputStream(
-            samplerate=MIC_SAMPLE_RATE,
-            channels=1,
-            dtype='int16',
-            blocksize=WEBRTC_FRAME_SIZE,
-            device=MIC_DEVICE_INDEX,
-        ) as stream:
-            
-            if DEBUG:
-                print("[Buddy][VAD] 🎧 Ultra-responsive monitoring started")
-            
-            consecutive_speech = 0
-            min_speech_frames = 2  # Just 2 frames for instant response!
-            silence_counter = 0
-            
-            # FIXED: Continue monitoring WHILE Buddy is talking
-            # Only exit when Buddy STOPS talking or we've processed an interrupt
-            while buddy_talking.is_set():
-                try:
-                    data, _ = stream.read(WEBRTC_FRAME_SIZE)
+        stream = p.open(
+            format=FORMAT_INT16,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            input=True,
+            input_device_index=microphone_device_index,
+            frames_per_buffer=CHUNK_SIZE
+        )
+        
+        print("[Buddy][VAD] 🎧 Ultra-responsive monitoring started")
+        
+        while vad_thread_active.is_set() and buddy_talking.is_set():
+            try:
+                # Read audio data
+                audio_data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                audio_np = np.frombuffer(audio_data, dtype=np.int16)
+                
+                # Calculate volume (RMS)
+                volume = int(np.sqrt(np.mean(audio_np.astype(np.float32) ** 2)))
+                
+                # CRITICAL: Lower threshold for better detection
+                if volume > 800:  # Lowered from 1000 to 800
+                    print(f"[Buddy][VAD] ⚡ INSTANT INTERRUPT! (volume: {volume})")
                     
-                    # Quick downsample
-                    downsampled = resample_poly(data.flatten(), 16000, MIC_SAMPLE_RATE).astype(np.int16)
+                    # IMMEDIATE INTERRUPT ACTION
+                    full_duplex_interrupt_flag.set()
+                    vad_triggered.set()
                     
-                    if len(downsampled) >= WEBRTC_FRAME_SIZE:
-                        frame = downsampled[:WEBRTC_FRAME_SIZE]
-                        
-                        # Quick AEC
-                        cleaned_frame = apply_aec(frame.tobytes(), bypass_aec=BYPASS_AEC)
-                        
-                        # Volume check for real speech
-                        frame_np = np.frombuffer(cleaned_frame, dtype=np.int16)
-                        volume = np.abs(frame_np).mean()
-                        
-                        if volume > 600:  # Significant speech volume
-                            if vad.is_speech(cleaned_frame, 16000):
-                                consecutive_speech += 1
-                                silence_counter = 0
-                                
-                                if consecutive_speech >= min_speech_frames:
-                                    print(f"\n[Buddy][VAD] ⚡ INSTANT INTERRUPT! (volume: {volume})")
-                                    full_duplex_interrupt_flag.set()
-                                    stop_playback()
-                                    # FIXED: Exit after processing interrupt
-                                    break
-                            else:
-                                consecutive_speech = max(0, consecutive_speech - 1)
-                                silence_counter += 1
-                        else:
-                            consecutive_speech = 0
-                            silence_counter += 1
-                            
-                        # Auto-exit if too much silence (Buddy finished talking)
-                        if silence_counter > 100:  # ~2 seconds of silence
-                            if DEBUG:
-                                print("[Buddy][VAD] Auto-exit due to silence")
-                            break
-                            
-                except Exception:
+                    # Force stop current playback
+                    stop_playback()
+                    
+                    # Clear VAD flags and exit
+                    vad_thread_active.clear()
+                    buddy_talking.clear()
+                    
+                    print("[Buddy][VAD] 🛑 Interrupt processed - VAD stopped")
                     break
                     
-                # Minimal sleep for maximum responsiveness
-                time.sleep(0.001)
-
+            except Exception as e:
+                if DEBUG:
+                    print(f"[Buddy][VAD] Error: {e}")
+                continue
+                
     except Exception as e:
-        if DEBUG:
-            print(f"[Buddy][VAD ERROR] {e}")
+        print(f"[Buddy][VAD] Stream error: {e}")
     finally:
+        if stream:
+            stream.stop_stream()
+            stream.close()
+        p.terminate()
         vad_thread_active.clear()
-        if DEBUG:
-            print("[Buddy][VAD] 🔇 Monitoring stopped")
+        print("[Buddy][VAD] 🔇 Full-duplex monitoring stopped")
 
 # ========== MULTI-SPEAKER DETECTION ==========
 def detect_active_speaker(audio_chunk):
@@ -914,70 +906,153 @@ def listen_for_input():
         print("[Buddy][VAD] Stream closed.")
 
 def background_vad_listener():
-    """Ultra-responsive background VAD for interruptions"""
-    global vad_thread_active
+    """Smart VAD with AEC-based self-voice filtering"""
+    global vad_thread_active, reference_audio_buffer
     
-    if vad_thread_active.is_set():
-        return
-        
+    print("[Buddy][VAD] 🎧 AEC-filtered monitoring starting...")
     vad_thread_active.set()
-    vad = webrtcvad.Vad(1)  # More sensitive for interruptions
+    
+    # Initialize audio stream
+    p = pyaudio.PyAudio()
+    stream = None
     
     try:
-        with sd.InputStream(
-            samplerate=MIC_SAMPLE_RATE,
+        stream = p.open(
+            format=pyaudio.paInt16,
             channels=1,
-            dtype='int16',
-            blocksize=WEBRTC_FRAME_SIZE,  # Smaller blocks for faster response
-            device=MIC_DEVICE_INDEX,
-        ) as stream:
-            
-            print("[Buddy][VAD] 🎧 Full-duplex monitoring active")
-            
-            consecutive_speech = 0
-            min_speech_frames = 2  # Very fast trigger - just 2 frames!
-            
-            while buddy_talking.is_set() and not full_duplex_interrupt_flag.is_set():
+            rate=16000,
+            input=True,
+            input_device_index=None,
+            frames_per_buffer=1024,
+            stream_callback=None
+        )
+        
+        print("[Buddy][VAD] 🎧 AEC-filtered monitoring ACTIVE!")
+        consecutive_low_volume = 0
+        
+        while vad_thread_active.is_set() and buddy_talking.is_set():
+            try:
+                # Read microphone input
+                mic_data = stream.read(1024, exception_on_overflow=False)
+                mic_audio = np.frombuffer(mic_data, dtype=np.int16).astype(np.float32)
+                
+                # Get current reference audio (what Buddy is saying)
+                reference_chunk = None
                 try:
-                    data, overflowed = stream.read(WEBRTC_FRAME_SIZE)
+                    if len(reference_audio_buffer) > 0:
+                        # Get the most recent reference audio
+                        ref_samples = min(1024, len(reference_audio_buffer))
+                        reference_chunk = np.array(reference_audio_buffer[-ref_samples:], dtype=np.float32)
+                        
+                        # Normalize reference to match mic input scale
+                        if np.max(np.abs(reference_chunk)) > 0:
+                            reference_chunk = reference_chunk * (np.max(np.abs(mic_audio)) / np.max(np.abs(reference_chunk)))
+                except Exception as ref_err:
+                    reference_chunk = None
+                
+                # Simple AEC: Subtract reference from microphone
+                if reference_chunk is not None and len(reference_chunk) == len(mic_audio):
+                    # Apply simple echo cancellation
+                    aec_audio = mic_audio - (reference_chunk * 0.5)  # 50% cancellation
+                else:
+                    aec_audio = mic_audio
+                
+                # Calculate volume on AEC-processed audio
+                rms_volume = int(np.sqrt(np.mean(aec_audio ** 2)))
+                peak_volume = int(np.max(np.abs(aec_audio)))
+                
+                # Lower thresholds since we're using AEC
+                is_interrupt = rms_volume > 600 and peak_volume > 1500
+                
+                if is_interrupt:
+                    print(f"[Buddy][VAD] 🔊 Potential interrupt: RMS:{rms_volume} PEAK:{peak_volume}")
                     
-                    # Downsample for VAD
-                    downsampled = resample_poly(data.flatten(), 16000, MIC_SAMPLE_RATE).astype(np.int16)
+                    # Quick double-check with slight delay
+                    time.sleep(0.15)
                     
-                    if len(downsampled) >= WEBRTC_FRAME_SIZE:
-                        frame = downsampled[:WEBRTC_FRAME_SIZE]
+                    # Second sample
+                    try:
+                        mic_data2 = stream.read(1024, exception_on_overflow=False)
+                        mic_audio2 = np.frombuffer(mic_data2, dtype=np.int16).astype(np.float32)
                         
-                        # Apply AEC
-                        cleaned_frame = apply_aec(frame.tobytes(), bypass_aec=BYPASS_AEC)
-                        
-                        # Check volume first - must be significant
-                        frame_np = np.frombuffer(cleaned_frame, dtype=np.int16)
-                        volume = np.abs(frame_np).mean()
-                        
-                        if volume > 800:  # Significant volume threshold
-                            if vad.is_speech(cleaned_frame, WEBRTC_SAMPLE_RATE):
-                                consecutive_speech += 1
-                                if consecutive_speech >= min_speech_frames:
-                                    print("\n[Buddy][VAD] ⚡ INSTANT INTERRUPT!")
-                                    full_duplex_interrupt_flag.set()
-                                    stop_playback()
-                                    return
-                            else:
-                                consecutive_speech = max(0, consecutive_speech - 1)
+                        # Apply AEC to second sample
+                        if reference_chunk is not None:
+                            aec_audio2 = mic_audio2 - (reference_chunk * 0.5)
                         else:
-                            consecutive_speech = 0
+                            aec_audio2 = mic_audio2
+                        
+                        rms_volume2 = int(np.sqrt(np.mean(aec_audio2 ** 2)))
+                        
+                        # Confirm sustained interrupt
+                        if rms_volume2 > 400:  # Lower confirmation threshold
+                            print(f"[Buddy][VAD] 🚨 CONFIRMED USER INTERRUPT! RMS1:{rms_volume} RMS2:{rms_volume2}")
                             
-                except Exception as read_err:
-                    print(f"[VAD] Error: {read_err}")
-                    break
+                            # TRIGGER INTERRUPT
+                            full_duplex_interrupt_flag.set()
+                            vad_triggered.set()
+                            
+                            print("[Buddy][VAD] 🛑 FORCING IMMEDIATE STOP!")
+                            
+                            # Stop current audio playback
+                            try:
+                                with audio_lock:
+                                    if 'current_audio_playback' in globals() and current_audio_playback:
+                                        if hasattr(current_audio_playback, 'is_playing') and current_audio_playback.is_playing():
+                                            current_audio_playback.stop()
+                                        current_audio_playback = None
+                                        print("[Buddy][VAD] ✅ Audio playback STOPPED")
+                            except Exception as stop_err:
+                                print(f"[Buddy][VAD] Stop error: {stop_err}")
+                            
+                            # Clear pending audio queue
+                            cleared_count = 0
+                            while not audio_queue.empty():
+                                try:
+                                    audio_queue.get_nowait()
+                                    audio_queue.task_done()
+                                    cleared_count += 1
+                                except queue.Empty:
+                                    break
+                            
+                            if cleared_count > 0:
+                                print(f"[Buddy][VAD] 🗑️ Cleared {cleared_count} pending audio chunks")
+                            
+                            # Clear flags
+                            buddy_talking.clear()
+                            vad_thread_active.clear()
+                            
+                            print("[Buddy][VAD] 🔇 AEC INTERRUPT COMPLETE - MONITORING STOPPED")
+                            break
+                        else:
+                            print(f"[Buddy][VAD] 🤖 Not sustained interrupt: {rms_volume2}")
+                    except Exception as confirm_err:
+                        print(f"[Buddy][VAD] Confirmation error: {confirm_err}")
+                else:
+                    consecutive_low_volume += 1
+                    # Periodic status (less frequent)
+                    if consecutive_low_volume % 100 == 0:
+                        print(f"[Buddy][VAD] 👂 AEC monitoring active... ({consecutive_low_volume})")
                     
-                # No sleep - maximum responsiveness!
-
-    except Exception as e:
-        print(f"[Buddy][VAD ERROR] {e}")
+            except Exception as read_err:
+                print(f"[Buddy][VAD] Read error: {read_err}")
+                time.sleep(0.05)
+                continue
+                
+    except Exception as stream_err:
+        print(f"[Buddy][VAD] Stream initialization error: {stream_err}")
     finally:
+        try:
+            if stream:
+                stream.stop_stream()
+                stream.close()
+        except:
+            pass
+        try:
+            p.terminate()
+        except:
+            pass
         vad_thread_active.clear()
-        print("[Buddy][VAD] 🔇 Full-duplex monitoring stopped")
+        print("[Buddy][VAD] 🔇 AEC-filtered monitoring STOPPED")
 
 def cancel_mic_audio(mic_chunk):
     mic = np.frombuffer(mic_chunk, dtype=np.int16)
@@ -1113,12 +1188,196 @@ def _play_accumulated_audio_gapless(audio_chunks):
     except Exception as e:
         print(f"[Playback ERROR] Audio combination error: {e}")
 
+def simple_voice_detector():
+    """Voice detector that ONLY listens when Buddy is completely silent"""
+    import pyaudio
+    import numpy as np
+    
+    print("[Buddy][Voice] 🎤 Safe voice detector starting...")
+    
+    # Wait for all audio to finish before starting detection
+    print("[Buddy][Voice] 🔕 Waiting for Buddy to finish speaking...")
+    
+    # Wait until audio queue is empty AND no playback is active
+    while True:
+        try:
+            # Check if buddy is still talking
+            if not buddy_talking.is_set():
+                print("[Buddy][Voice] ✅ Buddy finished talking - detector can start")
+                break
+                
+            # Check if audio queue is empty
+            if audio_queue.empty():
+                # Check if there's active playback
+                with audio_lock:
+                    if not (current_audio_playback and current_audio_playback.is_playing()):
+                        print("[Buddy][Voice] ✅ All audio finished - detector starting")
+                        time.sleep(0.5)  # Extra safety delay
+                        break
+            
+            time.sleep(0.1)  # Wait and check again
+            
+        except Exception as e:
+            print(f"[Buddy][Voice] Wait error: {e}")
+            time.sleep(0.1)
+    
+    # Initialize audio stream ONLY after Buddy is completely silent
+    p = pyaudio.PyAudio()
+    stream = None
+    
+    try:
+        stream = p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            input_device_index=None,
+            frames_per_buffer=2048
+        )
+        
+        print("[Buddy][Voice] 🎤 SAFE Voice detector ACTIVE - say 'STOP' VERY loudly!")
+        
+        # Monitor with VERY high threshold since Buddy is silent
+        while buddy_talking.is_set():
+            try:
+                # Double-check Buddy is still silent
+                with audio_lock:
+                    if current_audio_playback and current_audio_playback.is_playing():
+                        print("[Buddy][Voice] 🔕 Buddy started talking again - detector pausing")
+                        break
+                
+                # Read audio
+                audio_data = stream.read(2048, exception_on_overflow=False)
+                audio_np = np.frombuffer(audio_data, dtype=np.int16)
+                
+                # Calculate volume
+                rms_volume = int(np.sqrt(np.mean(audio_np.astype(np.float32) ** 2)))
+                
+                # EXTREMELY HIGH threshold since no background audio
+                if rms_volume > 3500:  # Much higher threshold
+                    print(f"[Buddy][Voice] 🔊 VERY LOUD VOICE DETECTED: {rms_volume}")
+                    
+                    # Double confirmation with delay
+                    time.sleep(0.2)
+                    audio_data2 = stream.read(2048, exception_on_overflow=False)
+                    audio_np2 = np.frombuffer(audio_data2, dtype=np.int16)
+                    rms_volume2 = int(np.sqrt(np.mean(audio_np2.astype(np.float32) ** 2)))
+                    
+                    if rms_volume2 > 3000:  # Confirm sustained volume
+                        print(f"[Buddy][Voice] 🚨 CONFIRMED INTERRUPT: {rms_volume} -> {rms_volume2}")
+                        manual_interrupt_buddy()
+                        break
+                    else:
+                        print(f"[Buddy][Voice] 🤖 False alarm: {rms_volume} -> {rms_volume2}")
+                        
+            except Exception as e:
+                print(f"[Buddy][Voice] Error: {e}")
+                break
+                
+    except Exception as e:
+        print(f"[Buddy][Voice] Stream error: {e}")
+    finally:
+        try:
+            if stream:
+                stream.stop_stream()
+                stream.close()
+        except:
+            pass
+        try:
+            p.terminate()
+        except:
+            pass
+    
+    print("[Buddy][Voice] 🔇 Safe voice detector STOPPED")
+
+def parallel_interrupt_detector():
+    """Parallel interrupt detector that runs independently of Buddy's speech"""
+    import pyaudio
+    import numpy as np
+    
+    print("[Buddy][Parallel] 🎤 Parallel interrupt detector starting...")
+    
+    # Initialize audio stream immediately
+    p = pyaudio.PyAudio()
+    stream = None
+    
+    try:
+        stream = p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            input_device_index=None,
+            frames_per_buffer=1024
+        )
+        
+        print("[Buddy][Parallel] 🎤 ALWAYS-ON interrupt detector ACTIVE!")
+        print("[Buddy][Parallel] 📢 Say 'STOP' VERY loudly to interrupt!")
+        
+        consecutive_loud_frames = 0
+        required_loud_frames = 3  # Need 3 consecutive loud frames
+        
+        while True:  # Always running, independent of buddy_talking
+            try:
+                # Read audio continuously
+                audio_data = stream.read(1024, exception_on_overflow=False)
+                audio_np = np.frombuffer(audio_data, dtype=np.int16)
+                
+                # Calculate volume
+                rms_volume = int(np.sqrt(np.mean(audio_np.astype(np.float32) ** 2)))
+                peak_volume = int(np.max(np.abs(audio_np)))
+                
+                # Moderate threshold - not too high, not too low
+                is_loud = rms_volume > 1200 and peak_volume > 3000
+                
+                if is_loud:
+                    consecutive_loud_frames += 1
+                    if consecutive_loud_frames == 1:  # First loud frame
+                        print(f"[Buddy][Parallel] 🔊 Loud audio detected: RMS:{rms_volume} PEAK:{peak_volume}")
+                    
+                    # Trigger interrupt after consecutive loud frames
+                    if consecutive_loud_frames >= required_loud_frames:
+                        print(f"[Buddy][Parallel] 🚨 SUSTAINED INTERRUPT DETECTED! ({consecutive_loud_frames} frames)")
+                        
+                        # Only interrupt if Buddy is actually talking
+                        if buddy_talking.is_set():
+                            print("[Buddy][Parallel] 🛑 INTERRUPTING BUDDY!")
+                            manual_interrupt_buddy()
+                            break
+                        else:
+                            print("[Buddy][Parallel] 👂 Buddy not talking - ignoring interrupt")
+                            consecutive_loud_frames = 0
+                else:
+                    if consecutive_loud_frames > 0:
+                        print(f"[Buddy][Parallel] 🔇 Loud audio ended after {consecutive_loud_frames} frames")
+                    consecutive_loud_frames = 0
+                    
+            except Exception as e:
+                print(f"[Buddy][Parallel] Read error: {e}")
+                time.sleep(0.05)
+                continue
+                
+    except Exception as e:
+        print(f"[Buddy][Parallel] Stream error: {e}")
+    finally:
+        try:
+            if stream:
+                stream.stop_stream()
+                stream.close()
+        except:
+            pass
+        try:
+            p.terminate()
+        except:
+            pass
+    
+    print("[Buddy][Parallel] 🔇 Parallel interrupt detector STOPPED")
 
 def unified_audio_worker():
-    """Single, clean audio worker - no conflicts, minimal latency"""
+    """Single, clean audio worker - relies on parallel interrupt system"""
     global current_audio_playback, audio_worker_active
     
-    print("[Buddy][Audio] Unified worker started")
+    print("[Buddy][Audio] Unified worker started (PARALLEL INTERRUPT MODE)")
     audio_worker_active = True
     
     while audio_worker_active:
@@ -1164,6 +1423,7 @@ def unified_audio_worker():
                     # Monitor for interruption with minimal delay
                     while current_audio_playback.is_playing():
                         if full_duplex_interrupt_flag.is_set():
+                            print("[Buddy][Audio] 🛑 INTERRUPT DETECTED DURING PLAYBACK!")
                             current_audio_playback.stop()
                             break
                         time.sleep(0.002)  # 2ms check interval
@@ -1180,8 +1440,10 @@ def unified_audio_worker():
                         current_audio_playback = None
                 
                 finally:
+                    # Clear buddy_talking when ALL audio is done
                     if audio_queue.empty():
                         buddy_talking.clear()
+                        print("[Buddy][Audio] 🔇 All audio complete - ready for interrupts")
             
             audio_queue.task_done()
             
@@ -1189,10 +1451,334 @@ def unified_audio_worker():
             print(f"[Audio] Worker error: {e}")
             audio_queue.task_done()
     
-    print("[Buddy][Audio] Unified worker stopped")
+    print("[Buddy][Audio] Unified worker stopped (PARALLEL INTERRUPT MODE)")
+
+def manual_interrupt_buddy():
+    """Manual function to interrupt Buddy and immediately start listening for full user input"""
+    global current_audio_playback
+    
+    print("[Buddy][Manual] 🛑 MANUAL INTERRUPT TRIGGERED!")
+    
+    # Set interrupt flag
+    full_duplex_interrupt_flag.set()
+    vad_triggered.set()
+    
+    # Stop current audio
+    try:
+        with audio_lock:
+            if current_audio_playback and current_audio_playback.is_playing():
+                current_audio_playback.stop()
+                current_audio_playback = None
+                print("[Buddy][Manual] ✅ Audio playback STOPPED")
+    except Exception as e:
+        print(f"[Buddy][Manual] Stop error: {e}")
+    
+    # Clear audio queue
+    cleared = 0
+    while not audio_queue.empty():
+        try:
+            audio_queue.get_nowait()
+            audio_queue.task_done()
+            cleared += 1
+        except queue.Empty:
+            break
+    
+    if cleared > 0:
+        print(f"[Buddy][Manual] 🗑️ CLEARED {cleared} queued audio chunks")
+    
+    # Clear flags
+    buddy_talking.clear()
+    vad_thread_active.clear()
+    
+    print("[Buddy][Manual] 🔇 MANUAL INTERRUPT COMPLETE")
+    
+    # ✅ IMPORTANT: Immediately restart listening for the FULL user question
+    print("[Buddy][Manual] 🎧 RESTARTING LISTENING FOR FULL USER INPUT...")
+    
+    # Wait a moment for audio to settle
+    time.sleep(0.3)
+    
+    # Start extended listening session to catch the full question
+    threading.Thread(target=extended_listening_after_interrupt, daemon=True).start()
+
+def extended_listening_after_interrupt():
+    """Extended listening session after interrupt to capture full user question"""
+    print("[Buddy][Extended] 🎧 Starting extended listening for full user input...")
+    
+    import pyaudio
+    import numpy as np
+    from collections import deque
+    
+    # Audio buffer to collect continuous speech
+    audio_buffer = deque()
+    silence_threshold = 300  # Lower threshold for detecting speech
+    silence_duration = 0
+    max_silence_frames = 30  # ~3 seconds of silence before stopping
+    
+    p = pyaudio.PyAudio()
+    stream = None
+    
+    try:
+        stream = p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            input_device_index=None,
+            frames_per_buffer=1024
+        )
+        
+        print("[Buddy][Extended] 🎧 EXTENDED LISTENING ACTIVE - speak your full question!")
+        
+        speech_detected = False
+        frames_since_speech = 0
+        
+        for frame_count in range(500):  # Max ~50 seconds of listening
+            try:
+                # Read audio
+                audio_data = stream.read(1024, exception_on_overflow=False)
+                audio_np = np.frombuffer(audio_data, dtype=np.int16)
+                
+                # Calculate volume
+                rms_volume = int(np.sqrt(np.mean(audio_np.astype(np.float32) ** 2)))
+                
+                # Collect audio data
+                audio_buffer.append(audio_data)
+                
+                # Detect speech
+                if rms_volume > silence_threshold:
+                    if not speech_detected:
+                        print(f"[Buddy][Extended] 🗣️ Speech detected! RMS: {rms_volume}")
+                        speech_detected = True
+                    frames_since_speech = 0
+                else:
+                    frames_since_speech += 1
+                
+                # Check if we should stop listening
+                if speech_detected and frames_since_speech > max_silence_frames:
+                    print("[Buddy][Extended] 🔇 Extended silence detected - processing audio")
+                    break
+                    
+                # Show periodic status
+                if frame_count % 50 == 0:
+                    print(f"[Buddy][Extended] 👂 Listening... ({frame_count/10:.1f}s)")
+                    
+            except Exception as e:
+                print(f"[Buddy][Extended] Audio read error: {e}")
+                break
+        
+        # Process collected audio if we detected speech
+        if speech_detected and len(audio_buffer) > 10:
+            print(f"[Buddy][Extended] 🎙️ Processing {len(audio_buffer)} audio frames...")
+            
+            # Combine all audio data
+            combined_audio = b''.join(audio_buffer)
+            
+            # Save to temporary file and transcribe using the global whisper model
+            import tempfile
+            import wave
+            
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                with wave.open(temp_file.name, 'wb') as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(16000)
+                    wav_file.writeframes(combined_audio)
+                
+                # Transcribe the full audio using the global whisper model
+                try:
+                    # ✅ FIXED: Use the global whisper_model instead of undefined 'model'
+                    result = whisper_model.transcribe(temp_file.name, language="en")
+                    transcribed_text = result["text"].strip()
+                    
+                    if transcribed_text and len(transcribed_text) > 3:
+                        print(f"[Buddy][Extended] 📝 FULL TRANSCRIPTION: '{transcribed_text}'")
+                        
+                        # ✅ FIXED: Process the question directly without calling handle_user_interaction again
+                        # Instead, trigger the main listening loop to process this transcription
+                        print(f"[Buddy][Extended] 🧠 Processing question: '{transcribed_text}'")
+                        
+                        # Process the full question with LLM
+                        try:
+                            # Call handle_user_interaction with the transcribed text
+                            threading.Thread(
+                                target=process_extended_transcription,
+                                args=(transcribed_text,),
+                                daemon=True
+                            ).start()
+                        except Exception as proc_err:
+                            print(f"[Buddy][Extended] Processing error: {proc_err}")
+                        
+                    else:
+                        print("[Buddy][Extended] ❌ No clear speech detected")
+                        print("[Buddy] 👂 Ready for your next question...")
+                        
+                except Exception as e:
+                    print(f"[Buddy][Extended] Transcription error: {e}")
+                    print("[Buddy] 👂 Ready for your next question...")
+                finally:
+                    # Clean up temp file
+                    try:
+                        import os
+                        os.unlink(temp_file.name)
+                    except:
+                        pass
+        else:
+            print("[Buddy][Extended] ❌ No speech detected during extended listening")
+            print("[Buddy] 👂 Ready for your next question...")
+            
+    except Exception as e:
+        print(f"[Buddy][Extended] Stream error: {e}")
+    finally:
+        try:
+            if stream:
+                stream.stop_stream()
+                stream.close()
+        except:
+            pass
+        try:
+            p.terminate()
+        except:
+            pass
+    
+    print("[Buddy][Extended] 🔇 Extended listening session ended")
+
+def process_extended_transcription(transcribed_text):
+    """Process transcription from extended listening"""
+    try:
+        print(f"[Buddy][Extended] 🧠 Processing: '{transcribed_text}'")
+        
+        # Filter out the "stop" command if it's at the beginning
+        cleaned_text = transcribed_text.strip()
+        if cleaned_text.lower().startswith('stop.'):
+            cleaned_text = cleaned_text[5:].strip()
+        elif cleaned_text.lower().startswith('stop '):
+            cleaned_text = cleaned_text[5:].strip()
+        elif cleaned_text.lower().startswith('stop'):
+            cleaned_text = cleaned_text[4:].strip()
+        
+        if cleaned_text and len(cleaned_text) > 2:
+            print(f"[Buddy][Extended] 🗣️ Clean question: '{cleaned_text}'")
+            # Process with LLM
+            handle_user_interaction("Daveydrz", [], "auto", user_input=cleaned_text)
+        else:
+            print("[Buddy][Extended] ❌ No valid question after 'stop' command")
+            print("[Buddy] 👂 Ready for your next question...")
+            
+    except Exception as e:
+        print(f"[Buddy][Extended] Processing error: {e}")
+        print("[Buddy] 👂 Ready for your next question...")
+
+def simple_voice_detector():
+    """Voice detector that ONLY listens when Buddy is completely silent"""
+    import pyaudio
+    import numpy as np
+    
+    print("[Buddy][Voice] 🎤 Safe voice detector starting...")
+    
+    # Wait for all audio to finish before starting detection
+    print("[Buddy][Voice] 🔕 Waiting for Buddy to finish speaking...")
+    
+    # Wait until audio queue is empty AND no playback is active
+    while True:
+        try:
+            # Check if buddy is still talking
+            if not buddy_talking.is_set():
+                print("[Buddy][Voice] ✅ Buddy finished talking - detector can start")
+                break
+                
+            # Check if audio queue is empty
+            if audio_queue.empty():
+                # Check if there's active playback
+                with audio_lock:
+                    if not (current_audio_playback and current_audio_playback.is_playing()):
+                        print("[Buddy][Voice] ✅ All audio finished - detector starting")
+                        time.sleep(0.5)  # Extra safety delay
+                        break
+            
+            time.sleep(0.1)  # Wait and check again
+            
+        except Exception as e:
+            print(f"[Buddy][Voice] Wait error: {e}")
+            time.sleep(0.1)
+    
+    # Initialize audio stream ONLY after Buddy is completely silent
+    p = pyaudio.PyAudio()
+    stream = None
+    
+    try:
+        stream = p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            input_device_index=None,
+            frames_per_buffer=2048
+        )
+        
+        print("[Buddy][Voice] 🎤 SAFE Voice detector ACTIVE - say 'STOP' VERY loudly!")
+        
+        # Monitor with VERY high threshold since Buddy is silent
+        while buddy_talking.is_set():
+            try:
+                # Double-check Buddy is still silent
+                with audio_lock:
+                    if current_audio_playback and current_audio_playback.is_playing():
+                        print("[Buddy][Voice] 🔕 Buddy started talking again - detector pausing")
+                        break
+                
+                # Read audio
+                audio_data = stream.read(2048, exception_on_overflow=False)
+                audio_np = np.frombuffer(audio_data, dtype=np.int16)
+                
+                # Calculate volume
+                rms_volume = int(np.sqrt(np.mean(audio_np.astype(np.float32) ** 2)))
+                
+                # EXTREMELY HIGH threshold since no background audio
+                if rms_volume > 3500:  # Much higher threshold
+                    print(f"[Buddy][Voice] 🔊 VERY LOUD VOICE DETECTED: {rms_volume}")
+                    
+                    # Double confirmation with delay
+                    time.sleep(0.2)
+                    audio_data2 = stream.read(2048, exception_on_overflow=False)
+                    audio_np2 = np.frombuffer(audio_data2, dtype=np.int16)
+                    rms_volume2 = int(np.sqrt(np.mean(audio_np2.astype(np.float32) ** 2)))
+                    
+                    if rms_volume2 > 3000:  # Confirm sustained volume
+                        print(f"[Buddy][Voice] 🚨 CONFIRMED INTERRUPT: {rms_volume} -> {rms_volume2}")
+                        manual_interrupt_buddy()
+                        break
+                    else:
+                        print(f"[Buddy][Voice] 🤖 False alarm: {rms_volume} -> {rms_volume2}")
+                        
+            except Exception as e:
+                print(f"[Buddy][Voice] Error: {e}")
+                break
+                
+    except Exception as e:
+        print(f"[Buddy][Voice] Stream error: {e}")
+    finally:
+        try:
+            if stream:
+                stream.stop_stream()
+                stream.close()
+        except:
+            pass
+        try:
+            p.terminate()
+        except:
+            pass
+    
+    print("[Buddy][Voice] 🔇 Safe voice detector STOPPED")
+
+# Start voice detector when Buddy starts talking
+def start_voice_detector():
+    """Start voice detector in background"""
+    if buddy_talking.is_set():
+        threading.Thread(target=simple_voice_detector, daemon=True).start()
 
 def speak_async(text, lang=DEFAULT_LANG, style=None):
-    """Ultra-fast TTS with immediate playback"""
+    """Ultra-fast TTS with immediate playback - parallel interrupt handles interruption"""
     global audio_worker_active
     
     if DEBUG:
@@ -1240,23 +1826,28 @@ def stop_playback():
     """Enhanced stop with unified system"""
     global current_audio_playback
     
-    if DEBUG:
-        print("[Buddy] 🛑 Stopping all audio...")
+    print("[Buddy] 🛑 STOP_PLAYBACK CALLED!")  # ALWAYS print this
     
     # Set interrupt flag
     full_duplex_interrupt_flag.set()
+    print(f"[Buddy] 🚨 Interrupt flag set: {full_duplex_interrupt_flag.is_set()}")
     
     # Stop current playback
     with audio_lock:
-        if current_audio_playback and current_audio_playback.is_playing():
-            try:
-                current_audio_playback.stop()
-                current_audio_playback = None
-                if DEBUG:
-                    print("[Buddy] ✅ Audio stopped")
-            except Exception as e:
-                if DEBUG:
-                    print(f"[Buddy] Stop error: {e}")
+        if current_audio_playback:
+            print(f"[Buddy] 🎵 Found active playback: {current_audio_playback}")
+            if current_audio_playback.is_playing():
+                print("[Buddy] 🛑 Stopping active audio...")
+                try:
+                    current_audio_playback.stop()
+                    current_audio_playback = None
+                    print("[Buddy] ✅ Audio stopped successfully")
+                except Exception as e:
+                    print(f"[Buddy] ❌ Stop error: {e}")
+            else:
+                print("[Buddy] 🎵 Audio not playing")
+        else:
+            print("[Buddy] 🔇 No active playback found")
     
     # Clear audio queue
     cleared = 0
@@ -1268,13 +1859,10 @@ def stop_playback():
         except queue.Empty:
             break
     
-    if DEBUG and cleared > 0:
-        print(f"[Buddy] 🗑️ Cleared {cleared} queued audio chunks")
+    print(f"[Buddy] 🗑️ Cleared {cleared} queued audio chunks")
     
     buddy_talking.clear()
-    
-    if DEBUG:
-        print("[Buddy] 🔄 Ready for new input")
+    print(f"[Buddy] 🔄 buddy_talking cleared: {not buddy_talking.is_set()}")
 
 def play_chime():
     try:
@@ -1317,45 +1905,6 @@ def set_ref_audio(raw_bytes):
     except Exception as e:
         print(f"[AEC] Error in set_ref_audio: {e}")
 
-def stop_playback():
-    """Enhanced stop playback with unified system"""
-    global current_audio_playback
-
-    if DEBUG:
-        print("[Buddy] 🛑 Stopping playback...")
-
-    # Set interrupt flag first
-    full_duplex_interrupt_flag.set()
-
-    # Stop current playback instantly
-    try:
-        with audio_lock:  # FIXED: Use unified audio_lock
-            if current_audio_playback and current_audio_playback.is_playing():
-                current_audio_playback.stop()
-                current_audio_playback = None
-                if DEBUG:
-                    print("[Buddy] ✅ Audio playback stopped")
-    except Exception as e:
-        if DEBUG:
-            print(f"[Buddy] Error stopping audio: {e}")
-
-    # FIXED: Clear unified audio queue only
-    cleared_audio = 0
-    while not audio_queue.empty():
-        try:
-            audio_queue.get_nowait()
-            audio_queue.task_done()
-            cleared_audio += 1
-        except queue.Empty:
-            break
-    if DEBUG and cleared_audio > 0:
-        print(f"[Buddy] 🗑️ Cleared {cleared_audio} queued audio chunks")
-
-    # Clear flags
-    buddy_talking.clear()
-
-    if DEBUG:
-        print("[Buddy] 🔄 Ready for new input")
 
 def wait_after_buddy_speaks(delay=0.3):
     # FIXED: Use unified audio_queue instead of playback_queue
@@ -2475,7 +3024,7 @@ def handle_user_interaction(speaker, history, conversation_mode="auto"):
     """
     
     # Get current context - UPDATED to current time
-    current_datetime = "2025-06-28 11:51:34"
+    current_datetime = "2025-06-28 22:10:42"
     current_user = "Daveydrz"
     
     # Clean audio state with better timeout handling
@@ -2693,7 +3242,7 @@ def handle_user_interaction(speaker, history, conversation_mode="auto"):
     if DEBUG:
         print(f"[Buddy] 🗣️ Detected language: {lang}")
 
-    # FIXED: Much more specific time/date detection with current datetime
+    # FIXED: Much more specific time/date detection with CURRENT datetime
     def is_time_date_question(text):
         """Check if this is specifically asking for time or date"""
         text_lower = text.lower().strip()
@@ -2737,11 +3286,11 @@ def handle_user_interaction(speaker, history, conversation_mode="auto"):
             print("[Buddy] 🕐 Detected specific time/date question")
             
         if any(word in question.lower() for word in ['time', 'clock']):
-            response = f"It's currently 11:51 AM UTC, or {current_datetime} in full format."
+            response = f"It's currently 10:10 PM UTC, or {current_datetime} in full format."
         elif any(word in question.lower() for word in ['date', 'day', 'today']):
             response = f"Today is Friday, June 28th, 2025."
         else:
-            response = f"The current date and time is {current_datetime} UTC - that's Friday, June 28th, 2025 at 11:51 AM."
+            response = f"The current date and time is {current_datetime} UTC - that's Friday, June 28th, 2025 at 10:10 PM."
         
         speak_async(response, lang)
         
