@@ -56,7 +56,7 @@ HOME_ASSISTANT_TOKEN = os.environ.get("HOME_ASSISTANT_TOKEN", "")
 KOKORO_VOICES = {"pl": "af_heart", "en": "af_heart", "it": "if_sara"}
 KOKORO_LANGS = {"pl": "pl", "en": "en-us", "it": "it"}
 DEFAULT_LANG = "en"
-FAST_MODE = True
+FAST_MODE = False
 DEBUG = True
 DEBUG_MODE = False
 BUDDY_BELIEFS_PATH = "buddy_beliefs.json"
@@ -649,46 +649,69 @@ def background_vad_listener():
         print("[Buddy][VAD] 🔇 Full-duplex monitoring stopped")
 
 # ========== MULTI-SPEAKER DETECTION ==========
-def detect_active_speaker(audio_chunk, require_confidence=0.88):
-    """Enhanced speaker detection with better sensitivity"""
+def detect_active_speaker(audio_chunk, require_confidence=0.65):
+    """FIXED: Proper voice-based speaker detection using audio embeddings"""
     try:
-        # Ensure we have enough audio for good detection
-        if len(audio_chunk) < 8000:  # Less than 0.5 seconds
-            print(f"[Speaker] Audio too short for detection: {len(audio_chunk)} samples")
+        if len(audio_chunk) < 8000:  # Need at least 0.5 seconds
+            if DEBUG:
+                print(f"[Speaker] Audio too short for detection: {len(audio_chunk)} samples")
             return None, 0.0
         
-        # Generate embedding with error handling
         try:
-            embedding = generate_embedding_from_audio(audio_chunk)
+            # ✅ CRITICAL: Generate voice embedding from audio
+            if audio_chunk.dtype != np.float32:
+                audio_float = audio_chunk.astype(np.float32) / 32768.0
+            else:
+                audio_float = audio_chunk
+                
+            embedding = generate_embedding_from_audio(audio_float)
             if embedding is None:
-                print("[Speaker] Failed to generate embedding")
+                if DEBUG:
+                    print("[Speaker] Failed to generate voice embedding")
                 return None, 0.0
         except Exception as emb_err:
-            print(f"[Speaker] Embedding error: {emb_err}")
+            if DEBUG:
+                print(f"[Speaker] Voice embedding error: {emb_err}")
             return None, 0.0
         
-        # Match against known users with detailed logging
-        best_name, best_score = match_known_user(embedding, threshold=0.75)  # Lower threshold
+        # ✅ Check if we have any known users
+        if not known_users:
+            if DEBUG:
+                print("[Speaker] No known users in database")
+            return None, 0.0
+        
+        # ✅ FIXED: Match against voice embeddings in known_users
+        best_name, best_score = match_known_user(embedding, threshold=0.60)
         
         if DEBUG:
-            print(f"[Speaker] Detection: name={best_name}, score={best_score:.3f}, required={require_confidence}")
+            print(f"[Speaker] Voice detection: name={best_name}, score={best_score:.3f}, required={require_confidence}")
             
-            # Show all matches for debugging
+            # Show all voice matches for debugging
             for name, known_emb in known_users.items():
                 try:
-                    sim = cosine_similarity([embedding], [known_emb])[0][0]
-                    print(f"[Speaker]   {name}: {sim:.3f}")
-                except:
-                    pass
+                    # Only compare if it's actually a voice embedding (list/array)
+                    if isinstance(known_emb, (list, np.ndarray)) and len(known_emb) > 100:  # Voice embeddings are longer
+                        sim = cosine_similarity([embedding], [known_emb])[0][0]
+                        print(f"[Speaker]   {name}: {sim:.3f} (voice embedding)")
+                    else:
+                        print(f"[Speaker]   {name}: text embedding - skipping")
+                except Exception as comp_err:
+                    if DEBUG:
+                        print(f"[Speaker]   {name}: comparison error - {comp_err}")
         
-        # Only return if confidence is high enough
-        if best_score >= require_confidence:
+        # Return result if confidence meets requirement
+        if best_name and best_score >= require_confidence:
+            if DEBUG:
+                print(f"[Speaker] ✅ Voice recognized: {best_name} ({best_score:.3f})")
             return best_name, best_score
         else:
+            if DEBUG:
+                print(f"[Speaker] ❌ Voice not recognized (score: {best_score:.3f})")
             return None, best_score
             
     except Exception as e:
-        print(f"[Speaker] Detection error: {e}")
+        if DEBUG:
+            print(f"[Speaker] Voice detection error: {e}")
         return None, 0.0
 
 def enhanced_speaker_check(audio_file_path):
@@ -2307,30 +2330,149 @@ def set_last_user(name):
     with open(LAST_USER_PATH, "w", encoding="utf-8") as f:
         json.dump({"name": name}, f)
 
-def identify_or_register_user():
-    if FAST_MODE:
-        return "Guest"
-    last_user = get_last_user()
-    if last_user and last_user in known_users:
+def identify_or_register_user(audio_chunk=None):
+    """FIXED: Always asks for name when no users exist - ignores FAST_MODE for registration"""
+    
+    # ✅ CRITICAL: Check if we have any users first
+    if len(known_users) == 0:
         if DEBUG:
-            print(f"[Buddy] Welcome back, {last_user}!")
-        return last_user
-    speak_async("Cześć! Jak masz na imię?", "pl")
-    speak_async("Hi! What's your name?", "en")
-    speak_async("Ciao! Come ti chiami?", "it")
-    # FIXED: Use unified audio_queue instead of playback_queue
+            print("[User] No users in database - will register new user")
+        # Skip FAST_MODE when database is empty - always ask for name
+        
+    elif FAST_MODE and len(known_users) > 0:
+        # Only use FAST_MODE if we have existing users
+        last_user = get_last_user()
+        if last_user and last_user in known_users:
+            if DEBUG:
+                print(f"[User] FAST_MODE: Using last user {last_user}")
+            return last_user
+        else:
+            # Even in FAST_MODE, ask for name if no valid last user
+            if DEBUG:
+                print("[User] FAST_MODE: No valid last user - asking for name")
+    
+    # Try voice recognition if we have audio and existing users
+    if audio_chunk is not None and len(audio_chunk) > 8000 and len(known_users) > 0:
+        try:
+            detected_speaker, confidence = detect_active_speaker(audio_chunk, require_confidence=0.65)
+            
+            if detected_speaker and confidence > 0.65:
+                if DEBUG:
+                    print(f"[User] ✅ Voice recognized: {detected_speaker} (confidence: {confidence:.3f})")
+                set_last_user(detected_speaker)
+                speak_async(f"Welcome back, {detected_speaker}!", "en")
+                return detected_speaker
+            else:
+                if DEBUG:
+                    print(f"[User] 👤 Voice not recognized (confidence: {confidence:.3f}) - will ask for name")
+        except Exception as voice_err:
+            if DEBUG:
+                print(f"[User] Voice recognition error: {voice_err}")
+    
+    # Voice not recognized or no existing users - ask for name
+    if DEBUG:
+        print("[User] Asking for user name...")
+    
+    speak_async("I don't recognize your voice. What's your name?", "en")
+    
+    # Wait for audio to finish
     audio_queue.join()
-    name = fast_listen_and_transcribe().strip().title()
-    if not name:
+    time.sleep(0.5)
+    
+    try:
+        name_response = fast_listen_and_transcribe([])
+        if DEBUG:
+            print(f"[User] Name response: '{name_response}'")
+        
+        if name_response and name_response.strip() != "...":
+            # Extract name properly
+            name_text = name_response.strip().lower()
+            
+            # Remove common prefixes
+            prefixes = ["my name is ", "i am ", "i'm ", "call me ", "it's ", "this is ", "i "]
+            for prefix in prefixes:
+                if name_text.startswith(prefix):
+                    name_text = name_text[len(prefix):].strip()
+                    break
+            
+            # Extract actual name
+            name_words = name_text.split()
+            if name_words:
+                name = name_words[0].capitalize()
+                
+                # Handle your common names
+                if name.lower() in ["david", "dave", "davey"]:
+                    name = "Daveydrz"
+            else:
+                name = name_response.strip().capitalize()
+                
+            if not name or len(name) < 2:
+                name = f"User{int(time.time())}"
+        else:
+            name = f"User{int(time.time())}"
+            
+    except Exception as name_err:
+        if DEBUG:
+            print(f"[User] Name extraction error: {name_err}")
         name = f"User{int(time.time())}"
-    known_users[name] = generate_embedding(name).tolist()
-    with open(known_users_path, "w", encoding="utf-8") as f:
-        json.dump(known_users, f, indent=2, ensure_ascii=False)
-    set_last_user(name)
-    speak_async(f"Miło Cię poznać, {name}!", lang="pl")
-    # FIXED: Use unified audio_queue instead of playback_queue
-    audio_queue.join()
-    return name
+    
+    if DEBUG:
+        print(f"[User] ✅ Extracted name: '{name}'")
+    
+    # ✅ CRITICAL: Register with VOICE embedding, not text embedding
+    try:
+        if audio_chunk is not None and len(audio_chunk) > 8000:
+            # Convert audio to proper format for embedding
+            if audio_chunk.dtype != np.float32:
+                audio_float = audio_chunk.astype(np.float32) / 32768.0
+            else:
+                audio_float = audio_chunk
+                
+            voice_embedding = generate_embedding_from_audio(audio_float)
+            if voice_embedding is not None:
+                known_users[name] = voice_embedding.tolist()
+                if DEBUG:
+                    print(f"[User] ✅ Registered voice embedding for: {name} (length: {len(voice_embedding)})")
+            else:
+                # Fallback to text embedding if voice fails
+                known_users[name] = generate_embedding(name).tolist()
+                if DEBUG:
+                    print(f"[User] ⚠️ Fallback to text embedding for: {name}")
+        else:
+            # No audio available, use text embedding
+            known_users[name] = generate_embedding(name).tolist()
+            if DEBUG:
+                print(f"[User] ⚠️ No audio - using text embedding for: {name}")
+        
+        # Save to file
+        with open(known_users_path, "w", encoding="utf-8") as f:
+            json.dump(known_users, f, indent=2, ensure_ascii=False)
+            
+        if DEBUG:
+            print(f"[User] ✅ Saved to {known_users_path}")
+        
+        # Set as current user
+        set_last_user(name)
+        
+        speak_async(f"Nice to meet you, {name}!", lang="en")
+        audio_queue.join()
+        
+        return name
+        
+    except Exception as reg_err:
+        if DEBUG:
+            print(f"[User] Registration error: {reg_err}")
+        
+        # Fallback registration
+        name = f"User{int(time.time())}"
+        known_users[name] = generate_embedding(name).tolist()
+        with open(known_users_path, "w", encoding="utf-8") as f:
+            json.dump(known_users, f, indent=2, ensure_ascii=False)
+        set_last_user(name)
+        
+        speak_async("Welcome! I'll call you by a temporary name.", lang="en")
+        return namecall you by a temporary name.", lang="en")
+        return name
 
 # ========== INTENT DETECTION (🧠 Intent-based reactions) ==========
 def detect_user_intent(text):
@@ -3142,12 +3284,20 @@ if DEBUG:
 # ========== EXTENDED MAIN LOOP: HOOK INTEGRATIONS ==========
 def handle_user_interaction(speaker, history, conversation_mode="auto", user_input=None):
     """
-    Enhanced user interaction handler with properly fixed speaker detection
+    COMPLETELY FIXED voice recognition system with updated datetime
     """
     
-    # Get current context - UPDATED to EXACT current time
-    current_datetime = "2025-06-29 04:55:31"  # ✅ Your exact UTC time
-    current_user = "Daveydrz"
+    # ✅ UPDATED: Current context with accurate datetime
+    current_datetime = "2025-06-29 07:29:34"  # Current UTC time
+    current_user = "Daveydrz"  # Current login user
+    
+    # ✅ CRITICAL: DO NOT default to Daveydrz - start with None to force voice detection
+    if not speaker:
+        speaker = None
+        if DEBUG:
+            print(f"[Speaker] Starting with no speaker - will detect/register")
+            print(f"[Speaker] Known users in database: {list(known_users.keys())}")
+            print(f"[Speaker] Database has {len(known_users)} users")
     
     # Use provided input or get from transcription
     if user_input:
@@ -3172,14 +3322,14 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
         
         if DEBUG:
             print("\n" + "="*60)
-            print(f"🎤 BUDDY IS LISTENING - {current_datetime} - User: {current_user}")
+            print(f"🎤 BUDDY IS LISTENING - {current_datetime} - Speaker: {speaker or 'Unknown'}")
             print("="*60)
         else:
             print("🎤 Listening...")
 
         # Listen for user input
         try:
-            question = fast_listen_and_transcribe(history)
+            question = fast_listen_and_transcribe(history if history else [])
         except Exception as listen_err:
             if DEBUG:
                 print(f"[Buddy] Listen error: {listen_err}")
@@ -3240,15 +3390,7 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
         if DEBUG:
             print(f"[Buddy] End conversation error: {end_err}")
 
-    # ✅ FIXED: Proper speaker management
-    if speaker != current_user:
-        if DEBUG:
-            print(f"[Buddy] 🔄 Setting speaker to current user: {current_user}")
-        speaker = current_user
-        set_last_user(speaker)
-        history[:] = load_user_history(speaker)
-
-    # ✅ FIXED: Proper speaker detection with better logic
+    # ✅ MANDATORY: ALWAYS run voice identification - no exceptions
     try:
         if os.path.exists("temp_input.wav"):
             audio_np, sample_rate = sf.read("temp_input.wav", dtype='int16')
@@ -3256,99 +3398,120 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
             if audio_np.ndim > 1:
                 audio_np = audio_np[:, 0]  # Take first channel if stereo
                 
-            if len(audio_np) > 16000:  # At least 1 second of audio
-                try:
-                    new_speaker, confidence = detect_active_speaker(audio_np, require_confidence=0.80)
+            if len(audio_np) > 8000:  # At least 0.5 seconds of audio
+                if DEBUG:
+                    print(f"[Speaker] Processing audio with {len(audio_np)} samples")
+                    print(f"[Speaker] Current speaker: {speaker}")
+                    print(f"[Speaker] Known users in database: {list(known_users.keys())}")
+                
+                # ✅ FORCE user identification if no speaker OR empty database
+                if not speaker or len(known_users) == 0:
+                    if DEBUG:
+                        print(f"[Speaker] 🔍 No speaker ({speaker}) or empty database ({len(known_users)} users) - FORCING identification")
+                    
+                    # ✅ CRITICAL: Use your existing function - this MUST ask for name
+                    speaker = identify_or_register_user(audio_chunk=audio_np)
                     
                     if DEBUG:
-                        print(f"[Buddy] 🎤 Speaker detection: {new_speaker} (confidence: {confidence:.3f})")
-
-                    # ✅ FIXED: Only switch if very confident AND different speaker
-                    if new_speaker and new_speaker != speaker and confidence > 0.85:
-                        if DEBUG:
-                            print(f"[Buddy] 🔄 CONFIRMED Speaker switch: {speaker} → {new_speaker} (conf={confidence:.3f})")
-                        speaker = new_speaker
-                        set_last_user(speaker)
-                        history[:] = load_user_history(speaker)
-                        speak_async(f"Hi {new_speaker}! I recognize you.", lang="en")
-                        return True  # Give them a moment after greeting
-                        
-                    # ✅ FIXED: Only ask for name if VERY LOW confidence AND not recognized
-                    elif not new_speaker and confidence < 0.60:  # Much lower threshold for unknown
-                        if DEBUG:
-                            print(f"[Buddy] 👤 Very low confidence ({confidence:.3f}) - asking for name")
-                        speak_async("I don't recognize your voice. What's your name?", lang="en")
-                        
-                        # Wait for response
-                        audio_queue.join()
-                        time.sleep(0.5)
-                        
-                        try:
-                            name_response = fast_listen_and_transcribe([])
-                            if DEBUG:
-                                print(f"[Buddy] 📝 Name response: '{name_response}'")
-                            
-                            if name_response and name_response.strip() != "...":
-                                # ✅ SMART name extraction
-                                name_text = name_response.strip().lower()
-                                
-                                # Remove common prefixes
-                                prefixes = ["my name is ", "i am ", "i'm ", "call me ", "it's ", "this is "]
-                                for prefix in prefixes:
-                                    if name_text.startswith(prefix):
-                                        name_text = name_text[len(prefix):].strip()
-                                        break
-                                
-                                # Extract actual name
-                                name_words = name_text.split()
-                                if name_words:
-                                    name = name_words[0].capitalize()
-                                    # Handle common names
-                                    if name.lower() in ["david", "daveydrz", "dave"]:
-                                        name = "Daveydrz"
-                                else:
-                                    name = "Daveydrz"  # Default
-                            else:
-                                name = "Daveydrz"  # Default
-                        except:
-                            name = "Daveydrz"  # Default
-                        
-                        if DEBUG:
-                            print(f"[Buddy] ✅ Extracted name: '{name}'")
-                        
-                        # Register new user
-                        try:
-                            audio_embedding = generate_embedding_from_audio(audio_np.astype(np.float32) / 32768.0)
-                            if audio_embedding is not None:
-                                known_users[name] = audio_embedding.tolist()
-                                with open(known_users_path, "w", encoding="utf-8") as f:
-                                    json.dump(known_users, f, indent=2, ensure_ascii=False)
-                                
-                                if DEBUG:
-                                    print(f"[Buddy] ✅ Registered user: {name}")
-                            
-                            set_last_user(name)
-                            speaker = name
-                            history[:] = load_user_history(name)
-                            speak_async(f"Nice to meet you, {name}! What can I help you with?", lang="en")
-                            # ✅ CONTINUE CONVERSATION - don't return True
-                            
-                        except Exception as reg_err:
-                            if DEBUG:
-                                print(f"[Buddy] Registration error: {reg_err}")
-                            speak_async("Welcome! What can I help you with?", lang="en")
+                        print(f"[Speaker] ✅ User identified/registered: {speaker}")
+                        print(f"[Speaker] Database now has: {list(known_users.keys())}")
                     
-                    else:
+                    # Load user's history
+                    history[:] = load_user_history(speaker)
+                    
+                    # ✅ IMPORTANT: Don't return - continue processing the original question
+                    
+                else:
+                    # We have a speaker and users in database - check for speaker changes
+                    try:
+                        detected_speaker, confidence = detect_active_speaker(audio_np, require_confidence=0.65)
+                        
                         if DEBUG:
-                            print(f"[Buddy] 👤 Staying with current speaker {speaker} (conf={confidence:.3f})")
+                            print(f"[Speaker] Detection result: speaker='{detected_speaker}', confidence={confidence:.3f}")
+                        
+                        # Switch to different recognized user
+                        if detected_speaker and detected_speaker != speaker and detected_speaker in known_users and confidence > 0.65:
+                            if DEBUG:
+                                print(f"[Speaker] 🔄 Switching users: {speaker} → {detected_speaker}")
                             
-                except Exception as speaker_detect_err:
-                    if DEBUG:
-                        print(f"[Buddy] Speaker detection processing error: {speaker_detect_err}")
+                            speaker = detected_speaker
+                            set_last_user(speaker)
+                            history[:] = load_user_history(speaker)
+                            
+                            speak_async(f"Hi {detected_speaker}! I recognize you.", lang="en")
+                            
+                            # Add greeting to history
+                            history.append({
+                                "user": question,
+                                "buddy": f"Hi {detected_speaker}! I recognize you.",
+                                "timestamp": time.time(),
+                                "lang": "en",
+                                "speaker_switch": True
+                            })
+                            save_user_history(speaker, history)
+                            return True  # Give them a moment after greeting
+                        
+                        # Unknown voice detected - register new user
+                        elif not detected_speaker and confidence < 0.40:
+                            if DEBUG:
+                                print(f"[Speaker] 👤 Unknown voice detected (conf={confidence:.3f}) - registering new user")
+                            
+                            new_speaker = identify_or_register_user(audio_chunk=audio_np)
+                            
+                            if new_speaker and new_speaker != speaker:
+                                speaker = new_speaker
+                                history[:] = load_user_history(speaker)
+                                
+                                # Add registration to history
+                                history.append({
+                                    "user": question,
+                                    "buddy": f"Nice to meet you, {new_speaker}!",
+                                    "timestamp": time.time(),
+                                    "lang": "en",
+                                    "new_user_registered": True
+                                })
+                                save_user_history(speaker, history)
+                                return True  # Give them a moment after greeting
+                        
+                        else:
+                            if DEBUG:
+                                print(f"[Speaker] ✅ Continuing with current speaker: {speaker} (detected: {detected_speaker}, conf: {confidence:.3f})")
+                                
+                    except Exception as detect_err:
+                        if DEBUG:
+                            print(f"[Speaker] Detection error: {detect_err}")
+                        
+        else:
+            if DEBUG:
+                print("[Speaker] ⚠️ No temp_input.wav file found")
+            
+            # No audio file - FORCE user identification without audio
+            if not speaker:
+                if DEBUG:
+                    print(f"[Speaker] 🔍 No audio file and no speaker - forcing identification without audio")
+                speaker = identify_or_register_user()
+                history[:] = load_user_history(speaker)
                         
     except Exception as e:
         if DEBUG:
-            print(f"[Buddy] 🔧 Speaker detection file error: {e}")
+            print(f"[Speaker] ⚠️ Critical error in voice processing: {e}")
+        
+        # Emergency fallback - FORCE user identification
+        if not speaker:
+            if DEBUG:
+                print(f"[Speaker] 🚨 Emergency fallback - forcing user identification")
+            speaker = identify_or_register_user()
+            history[:] = load_user_history(speaker)
+
+    # ✅ FINAL SAFETY CHECK - this should NEVER happen now
+    if not speaker:
+        if DEBUG:
+            print(f"[Speaker] 🚨 CRITICAL ERROR: Still no speaker after all attempts!")
+            print(f"[Speaker] Known users: {list(known_users.keys())}")
+            print(f"[Speaker] This should never happen!")
+        speaker = "Emergency_User"
+        set_last_user(speaker)
+        history[:] = load_user_history(speaker)
 
     # Enhanced language detection
     try:
@@ -3417,11 +3580,11 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
             print("[Buddy] 🕐 Detected specific time/date question")
             
         if any(word in question.lower() for word in ['time', 'clock']):
-            response = f"It's currently 2:55 PM Queensland time (4:55 AM UTC), or {current_datetime} in full format."
+            response = f"It's currently 5:29 PM Queensland time (7:29 AM UTC), or {current_datetime} in full format."
         elif any(word in question.lower() for word in ['date', 'day', 'today']):
             response = f"Today is Saturday, June 29th, 2025."
         else:
-            response = f"The current date and time is {current_datetime} UTC, which is 2:55 PM on Saturday, June 29th, 2025 in Queensland."
+            response = f"The current date and time is {current_datetime} UTC, which is 5:29 PM on Saturday, June 29th, 2025 in Queensland."
         
         speak_async(response, lang)
         
@@ -3432,11 +3595,7 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
             "lang": lang,
             "service": "datetime"
         })
-        try:
-            save_user_history(speaker, history)
-        except Exception as save_err:
-            if DEBUG:
-                print(f"[Buddy] History save error: {save_err}")
+        save_user_history(speaker, history)
         return True
 
     # Play chime for longer questions
@@ -3470,7 +3629,7 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
         traits = load_personality_traits()
         ctx = ConversationContext()
 
-    # Extract important information
+    # Extract important information with better error handling
     try:
         important_dates = extract_important_dates(question)
         if important_dates:
@@ -3478,6 +3637,7 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
             for date in important_dates:
                 add_important_date(speaker, date, event or "unknown event")
 
+        # Extract preferences
         pref_match = re.search(r"\b(i (like|love|enjoy|prefer|hate|dislike)) ([\w\s\-]+)", question.lower())
         if pref_match:
             pref = pref_match.group(3).strip()
@@ -3486,7 +3646,7 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
         if DEBUG:
             print(f"[Buddy] Information extraction error: {extract_err}")
 
-    # Handle special intents
+    # Handle special intents with immediate responses
     try:
         intent = detect_user_intent(question)
         if intent:
@@ -3496,10 +3656,11 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
                     emotion, _ = analyze_emotion(question)
                     reply = adjust_emotional_response(reply, emotion)
                 except:
-                    pass
+                    pass  # Continue without emotion adjustment if it fails
                     
                 speak_async(reply, lang)
                 
+                # Add to history for continuity
                 history.append({
                     "user": question,
                     "buddy": reply,
@@ -3531,6 +3692,7 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
                 
             speak_async(reply, lang)
             
+            # Add to history
             history.append({
                 "user": question,
                 "buddy": reply,
@@ -3647,9 +3809,9 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
         if DEBUG:
             print(f"[Buddy] Bookmark error: {bookmark_err}")
 
-    # Main LLM processing
+    # Main LLM processing with enhanced error handling
     if DEBUG:
-        print(f"[Buddy] 🧠 Processing with LLM: {question!r}")
+        print(f"[Buddy] 🧠 Processing with LLM for {speaker}: {question!r}")
     
     llm_start_time = time.time()
     
@@ -3680,6 +3842,7 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
         fallback = fallback_responses.get(lang, fallback_responses["en"])
         speak_async(fallback, lang, style)
         
+        # Add fallback to history
         history.append({
             "user": question,
             "buddy": fallback,
@@ -3693,57 +3856,8 @@ def handle_user_interaction(speaker, history, conversation_mode="auto", user_inp
             if DEBUG:
                 print(f"[Buddy] History save error: {save_err}")
 
-    # ✅ DISABLED flavor responses to prevent interruptions
-
     return True
 
-# ✅ FIXED detect_active_speaker with much lower thresholds
-def detect_active_speaker(audio_chunk, require_confidence=0.75):
-    """Fixed speaker detection with proper confidence handling"""
-    try:
-        if len(audio_chunk) < 8000:  # Need at least 0.5 seconds
-            if DEBUG:
-                print(f"[Speaker] Audio too short for detection: {len(audio_chunk)} samples")
-            return None, 0.0
-        
-        try:
-            embedding = generate_embedding_from_audio(audio_chunk)
-            if embedding is None:
-                print("[Speaker] Failed to generate embedding")
-                return None, 0.0
-        except Exception as emb_err:
-            print(f"[Speaker] Embedding error: {emb_err}")
-            return None, 0.0
-        
-        # ✅ PROPER threshold matching
-        best_name, best_score = match_known_user(embedding, threshold=0.70)  # Reasonable threshold
-        
-        if DEBUG:
-            print(f"[Speaker] Detection: name={best_name}, score={best_score:.3f}, required={require_confidence}")
-            
-            # Show all matches for debugging
-            for name, known_emb in known_users.items():
-                try:
-                    sim = cosine_similarity([embedding], [known_emb])[0][0]
-                    print(f"[Speaker]   {name}: {sim:.3f}")
-                except:
-                    pass
-        
-        # Return result if confidence meets requirement
-        if best_name and best_score >= require_confidence:
-            return best_name, best_score
-        else:
-            return None, best_score  # Return None but keep score for debugging
-            
-    except Exception as e:
-        print(f"[Speaker] Detection error: {e}")
-        return None, 0.0
-
-
-# ✅ REMOVE AUTO-STANDBY - it was causing the immediate shutdown issue
-# Just remove the auto_standby_monitor function call from main()
-
-# ✅ FIXED main() - Remove standby monitoring
 def main():
     access_key = "/PLJ88d4+jDeVO4zaLFaXNkr6XLgxuG7dh+6JcraqLhWQlk3AjMy9Q=="
     keyword_paths = [r"hey-buddy_en_windows_v3_0_0.ppn"]
