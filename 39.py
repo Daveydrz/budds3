@@ -64,6 +64,12 @@ LONG_TERM_MEMORY_PATH = "buddy_long_term_memory.json"
 PERSONALITY_TRAITS_PATH = "buddy_personality_traits.json"
 DYNAMIC_KNOWLEDGE_PATH = "buddy_dynamic_knowledge.json"
 
+FORMAT_INT16 = pyaudio.paInt16
+CHANNELS = 1
+SAMPLE_RATE = 16000
+CHUNK_SIZE = 1024
+microphone_device_index = MIC_DEVICE_INDEX
+
 # ========== AEC REFERENCE BUFFER (Config) ==========
 ref_audio_buffer = np.zeros(WEBRTC_SAMPLE_RATE * 2, dtype=np.int16)  # 2 seconds
 ref_audio_lock = threading.Lock()
@@ -1278,7 +1284,7 @@ def _play_accumulated_audio_gapless(audio_chunks):
 
             except Exception as e:
                 print(f"[Playbook ERROR] {e}")
-                if current_audio_playbook:
+                if current_audio_playback:
                     try:
                         current_audio_playback.stop()
                     except:
@@ -2471,7 +2477,6 @@ def identify_or_register_user(audio_chunk=None):
         set_last_user(name)
         
         speak_async("Welcome! I'll call you by a temporary name.", lang="en")
-        return namecall you by a temporary name.", lang="en")
         return name
 
 # ========== INTENT DETECTION (🧠 Intent-based reactions) ==========
